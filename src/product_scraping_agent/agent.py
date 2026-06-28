@@ -35,9 +35,6 @@ class ProductScrapingAgent:
             max_agent_iterations=request.max_agent_iterations,
             strict_product_only=request.strict_product_only,
             write_raw_debug=request.write_raw_debug,
-            proxy_url=request.proxy_url,
-            proxy_country_code=request.proxy_country_code,
-            enable_proxy_retry=request.enable_proxy_retry,
         )
         return rich.to_scrape_result()
 

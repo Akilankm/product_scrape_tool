@@ -18,10 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--main-text", default="", help="Optional source product text / item description")
     parser.add_argument("--ean", default="", help="Optional EAN/GTIN")
     parser.add_argument("--retailer-name", default="", help="Optional retailer name")
-    parser.add_argument("--country-code", default="", help="Optional ISO country code, e.g. CZ. Supporting context for routing/trace only.")
-    parser.add_argument("--proxy-url", default="", help="Optional proxy endpoint override. Prefer env/secret injection for credentials.")
-    parser.add_argument("--proxy-country-code", default="", help="Optional proxy target country override. Defaults to country_code, then URL country hint.")
-    parser.add_argument("--disable-proxy-retry", action="store_true", help="Disable same-URL proxy retry even if a proxy endpoint is configured.")
+    parser.add_argument("--country-code", default="", help="Optional ISO country code, e.g. CZ")
     parser.add_argument("--product-hint", default="", help="Optional override for image/claims prompt context")
     parser.add_argument("--upstream-ai-evidence", default="", help="Optional already-produced AI/search evidence text; no search is performed")
     parser.add_argument("--upstream-ai-evidence-file", default="", help="Optional text/markdown file containing upstream AI/search evidence")
@@ -82,9 +79,6 @@ async def main() -> None:
             vision_max=args.vision_max,
             max_agent_iterations=args.max_agent_iterations,
             write_raw_debug=args.write_raw_debug,
-            proxy_url=args.proxy_url,
-            proxy_country_code=args.proxy_country_code,
-            enable_proxy_retry=not args.disable_proxy_retry,
         )
     )
     print("\nSCRAPE RESULT")
@@ -95,12 +89,11 @@ async def main() -> None:
     print(f"product_evidence_md: {result.product_evidence_md_path}")
     print(f"claims_md: {result.claims_md_path}")
     print(f"evidence_recovery_report: {result.evidence_recovery_report_json_path}")
+    print(f"quality_report: {result.quality_report_json_path}")
     print(f"browser_visible: {result.browser_visible}")
     print(f"product_details_recovered: {result.product_details_recovered}")
     print(f"recovery_status: {result.recovery_status}")
     print(f"evidence_axes_used: {result.evidence_axes_used}")
-    print(f"url_analysis: {result.url_analysis.model_dump() if result.url_analysis else {}}")
-    print(f"proxy_plan: {result.proxy_plan}")
     print(f"agent_iterations: {result.agent_iterations}")
     print(f"error: {result.error}")
 

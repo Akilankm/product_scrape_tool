@@ -60,6 +60,13 @@ class Config:
     llm_vision_enabled: bool = _env_bool("LLM_VISION_ENABLED", True)
     llm_vision_max_images: int = _env_int("LLM_VISION_MAX_IMAGES", 12)
     llm_vision_detail: str = _env("LLM_VISION_DETAIL", "low")
+    relevance_batch_enabled: bool = _env_bool("RELEVANCE_BATCH_ENABLED", True)
+
+    # Image CDN recovery. These settings improve recovery when product gallery
+    # images return 403 to plain HTTP clients while the product page itself is accessible.
+    image_download_timeout: float = _env_float("IMAGE_DOWNLOAD_TIMEOUT", 20.0)
+    image_retry_strategies_enabled: bool = _env_bool("IMAGE_RETRY_STRATEGIES_ENABLED", True)
+    image_retry_strip_query: bool = _env_bool("IMAGE_RETRY_STRIP_QUERY", False)
 
     # Azure OpenAI / compatible gateway.
     llm_api_key: str = _env("LLM_API_KEY", "")

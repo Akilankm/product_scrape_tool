@@ -10,7 +10,6 @@ from typing import Any
 from .full_scraper import FullPage
 from .log import logger
 from .models import AgentPlan, ImageRef, ProductInputContext, ProductEvidence, TableRef, UpstreamEvidenceBundle
-from .url_analysis import URLAnalysis
 from .prompts import P
 from .text_utils import truncate_text
 
@@ -42,7 +41,7 @@ def _json_loads_object(text: str) -> dict[str, Any]:
     return obj
 
 
-def page_observation_summary(page: FullPage, input_context: ProductInputContext, product_hint: str, url_analysis: URLAnalysis | None = None) -> str:
+def page_observation_summary(page: FullPage, input_context: ProductInputContext, product_hint: str) -> str:
     """Compact planner context — enough for gap detection, not full final evidence."""
     head = {
         "requested_url": page.url,
@@ -67,11 +66,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
             "tables_html": len(page.tables_html),
             "json_ld_blocks": len(page.json_ld),
         },
-        "primary_input": {"product_url": page.url},
-        "url_analysis": url_analysis.model_dump() if url_analysis else {},
-        "supporting_context": input_context.model_dump(),
         "input_context": input_context.model_dump(),
-        "context_policy": "product_url is primary; optional fields are supporting planning/validation/routing context only",
         "product_hint": product_hint,
         "structured_keys": {
             "og": sorted(page.og.keys())[:50],
@@ -90,7 +85,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
     )
 
 
-def plan_next_actions(page: FullPage, input_context: ProductInputContext, product_hint: str, url_analysis: URLAnalysis | None = None) -> AgentPlan:
+def plan_next_actions(page: FullPage, input_context: ProductInputContext, product_hint: str) -> AgentPlan:
     """Ask the LLM whether more same-page scraping is required."""
     from .services.llm import get_llm_service
 
@@ -112,7 +107,7 @@ def plan_next_actions(page: FullPage, input_context: ProductInputContext, produc
         "extract_gallery_sources, retry_relaxed. Do not request web search.\n\n"
         "Return JSON with this shape:\n"
         f"```json\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n```\n\n"
-        f"{page_observation_summary(page, input_context, product_hint, url_analysis)}"
+        f"{page_observation_summary(page, input_context, product_hint)}"
     )
     resp = get_llm_service().predict(
         user,
@@ -249,19 +244,11 @@ def normalize_product_evidence(
     product_hint: str,
     upstream_evidence: UpstreamEvidenceBundle | None,
     scrape_id: str,
-    url_analysis: URLAnalysis | None = None,
-    proxy_plan: dict[str, Any] | None = None,
 ) -> ProductEvidence:
     """Produce the main noise-free product evidence JSON using the LLM."""
     from .services.llm import get_llm_service
 
     expected_schema = {
-        "url_first_trace": {
-            "primary_product_url": "",
-            "url_decomposition_summary": "domain/slug/product-id signals used for planning",
-            "supporting_context_role": "main_text/EAN/retailer/country are validation/planning context only",
-            "context_conflicts": [],
-        },
         "product_focus_summary": "1-3 sentence retailer-claim summary, no guesses",
         "product_identity": {
             "product_name": {"value": "", "evidence_axis": ["B", "T", "P", "A", "S"], "source_refs": [], "confidence": "high|medium|low|missing"},
@@ -318,10 +305,6 @@ def normalize_product_evidence(
     payload = {
         "scrape_id": scrape_id,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "primary_input": {"product_url": page.url},
-        "url_analysis": url_analysis.model_dump() if url_analysis else {},
-        "proxy_plan": proxy_plan or {},
-        "supporting_context_policy": "URL is the primary input. Optional fields are not product truth; use them only for decision trace, validation, relevance, locale/proxy routing.",
         "input_context": input_context.model_dump(),
         "product_hint": product_hint,
         "axis_S_structured": _structured_axis(page),
@@ -333,8 +316,7 @@ def normalize_product_evidence(
         "html_signal_sample": truncate_text(page.raw_html or "", _HTML_SIGNAL_CHARS),
     }
     user = (
-        "Build the complete URL-first, product-only retailer evidence JSON. Remove noise; do not summarize noisy content. "
-        "Treat product_url as the primary anchor; use main_text, EAN, retailer_name, country_code only as supporting trace/validation/routing context. "
+        "Build the complete product-only retailer evidence JSON. Remove noise; do not summarize noisy content. "
         "Preserve all product facts that the retailer page claims through text, tables, structured metadata, or images. "
         "Do not guess and do not use external knowledge.\n\n"
         "Return a JSON object matching this schema pattern:\n"
@@ -364,17 +346,9 @@ def deterministic_product_evidence(
     product_hint: str,
     upstream_evidence: UpstreamEvidenceBundle | None,
     reason: str,
-    url_analysis: URLAnalysis | None = None,
-    proxy_plan: dict[str, Any] | None = None,
 ) -> ProductEvidence:
     """Safe fallback when the LLM is unavailable; does not pretend to be complete."""
     return ProductEvidence(
-        url_first_trace={
-            "primary_product_url": page.url,
-            "url_analysis": url_analysis.model_dump() if url_analysis else {},
-            "proxy_plan": proxy_plan or {},
-            "supporting_context_role": "Optional inputs are trace/validation/routing context only; no product fact is invented from them.",
-        },
         product_focus_summary=(
             "LLM product-only normalization was unavailable. This fallback preserves only high-level captured "
             "signals and should not be treated as a complete normalized artifact."
@@ -410,9 +384,6 @@ def deterministic_product_evidence(
             "geo_restricted": page.geo_restricted,
             "proxy_used": page.proxy_used,
             "proxy_source": page.proxy_source,
-            "url_analysis": url_analysis.model_dump() if url_analysis else {},
-            "proxy_plan": proxy_plan or {},
-            "url_first_policy": "product_url is primary; optional context is supporting only",
             "browser_visible": bool(page.success and (page.raw_markdown or page.raw_html) and page.access_status == "accessible"),
             "has_upstream_indexed_evidence": bool(upstream_evidence and upstream_evidence.has_any()),
             "product_details_recovered": bool(upstream_evidence and upstream_evidence.has_any()) or bool(page.title or page.json_ld or page.raw_markdown),
@@ -592,6 +563,171 @@ def build_evidence_recovery_report(
         ],
     }
 
+
+
+def _evidence_text_blob(evidence: ProductEvidence | None) -> str:
+    if evidence is None:
+        return ""
+    try:
+        return json.dumps(evidence.model_dump(), ensure_ascii=False).lower()
+    except Exception:
+        return str(evidence).lower()
+
+
+def _has_any_term(blob: str, terms: list[str]) -> bool:
+    return any(term in blob for term in terms)
+
+
+def build_artifact_quality_report(
+    *,
+    evidence: ProductEvidence,
+    result: Any,
+    page: FullPage,
+    tables: list[TableRef],
+    images: list[ImageRef],
+    input_context: ProductInputContext,
+    upstream_evidence: UpstreamEvidenceBundle,
+) -> dict[str, Any]:
+    """Deterministic quality gate for the final product-only artifact.
+
+    The LLM creates the rich artifact; this gate audits whether the artifact is
+    strong enough to hand to downstream product coding. It never invents facts —
+    it checks presence, evidence axes, and capture health.
+    """
+    blob = _evidence_text_blob(evidence)
+    identity = evidence.product_identity or {}
+    claims_count = (
+        len(evidence.retailer_claims or [])
+        + len(evidence.structured_claims or [])
+        + len(evidence.table_claims or [])
+        + len(evidence.visual_claims or [])
+        + len(getattr(evidence, "upstream_indexed_claims", []) or [])
+    )
+    product_text_chars = sum(len(str((b or {}).get("content", ""))) for b in (evidence.product_only_text_blocks or []))
+    downloaded_images = [img for img in images if img.local_path]
+    described_images = [img for img in images if img.description]
+    download_403 = [img for img in images if "403" in (img.error or "")]
+    download_errors = [img for img in images if img.error]
+    axes = evidence_axes_from_product_evidence(evidence)
+
+    checks = {
+        "has_product_name_or_title": bool(
+            _has_any_term(blob, ["product_name", "product name", "name", "title"])
+            or bool(page.title)
+            or bool(input_context.main_text)
+        ),
+        "has_brand_signal": bool(_has_any_term(blob, ["brand", "manufacturer", "publisher"])) ,
+        "has_identifier_signal": bool(
+            bool(input_context.ean)
+            or _has_any_term(blob, ["ean", "gtin", "barcode", "isbn", "sku", "mpn", "article", "artikeldetails"])
+        ),
+        "has_retailer_url": bool(result.final_url or page.final_url or page.url),
+        "has_product_text": bool(product_text_chars >= 80 or evidence.retailer_claims or page.raw_markdown),
+        "has_visual_evidence": bool(described_images),
+        "has_table_or_structured_evidence": bool(tables or page.json_ld or page.og or page.product_meta or evidence.structured_claims or evidence.table_claims),
+        "has_evidence_axes": bool(axes),
+        "has_gap_reporting": isinstance(evidence.gaps, list),
+        "noise_exclusion_documented": bool(evidence.noise_exclusion_summary),
+        "browser_access_ok_or_recovered": bool(result.browser_visible or result.product_details_recovered or upstream_evidence.has_any()),
+    }
+
+    missing: list[str] = []
+    if not checks["has_product_name_or_title"]:
+        missing.append("product_name_or_title")
+    if not checks["has_brand_signal"]:
+        missing.append("brand_or_manufacturer_signal")
+    if not checks["has_retailer_url"]:
+        missing.append("retailer_url")
+    if not checks["has_product_text"] and not checks["has_table_or_structured_evidence"] and not checks["has_visual_evidence"]:
+        missing.append("product_evidence_content")
+    if not checks["has_evidence_axes"]:
+        missing.append("evidence_axis_tags")
+
+    warnings: list[str] = []
+    if download_403:
+        warnings.append(f"{len(download_403)} image candidate(s) failed with HTTP 403; CDN recovery may be partial")
+    if download_errors and len(downloaded_images) < max(3, len(images) // 4):
+        warnings.append("image download success rate is low")
+    if not described_images:
+        warnings.append("no vision-described product image retained")
+    if not tables and not page.json_ld:
+        warnings.append("no table or JSON-LD product data captured")
+    if result.access_status != "accessible":
+        warnings.append(f"browser access status is {result.access_status}; evidence recovery mode used")
+
+    # Score favours multiple independent axes over volume. This is deliberately
+    # conservative because the artifact is used downstream for product coding.
+    score = 0
+    score += 20 if checks["has_product_name_or_title"] else 0
+    score += 15 if checks["has_brand_signal"] else 0
+    score += 10 if checks["has_identifier_signal"] else 0
+    score += 10 if checks["has_retailer_url"] else 0
+    score += 15 if checks["has_product_text"] else 0
+    score += 10 if checks["has_table_or_structured_evidence"] else 0
+    score += 10 if checks["has_visual_evidence"] else 0
+    score += 10 if checks["has_evidence_axes"] else 0
+    if claims_count >= 5:
+        score += 5
+    if len(warnings) >= 3:
+        score -= 10
+    score = max(0, min(100, score))
+
+    if missing:
+        artifact_quality = "partial" if score >= 45 else "insufficient"
+    elif score >= 85 and len(warnings) <= 1:
+        artifact_quality = "strong"
+    elif score >= 65:
+        artifact_quality = "usable"
+    else:
+        artifact_quality = "partial"
+
+    requires_review = artifact_quality in {"partial", "insufficient"} or bool(missing)
+    recommended_followups: list[str] = []
+    if "product_name_or_title" in missing or "product_evidence_content" in missing:
+        recommended_followups.append("rerun with max_agent_iterations>=3 and write_raw_debug=true for audit")
+    if not described_images:
+        recommended_followups.append("check PCA_LLM_VISION_ENABLED and gateway vision permissions")
+    if download_403:
+        recommended_followups.append("enable/verify image CDN retry settings and referer/cookie/proxy configuration")
+    if result.access_status != "accessible":
+        recommended_followups.append("configure authorised target-country proxy or pass upstream AI/search evidence")
+    if not input_context.main_text and not input_context.ean:
+        recommended_followups.append("provide main_text and/or EAN to strengthen identity validation")
+
+    return {
+        "artifact_quality": artifact_quality,
+        "quality_score": score,
+        "requires_manual_review": requires_review,
+        "missing_critical_fields": missing,
+        "warnings": warnings,
+        "checks": checks,
+        "evidence_axes_used": axes,
+        "counts": {
+            "retailer_claims": len(evidence.retailer_claims or []),
+            "structured_claims": len(evidence.structured_claims or []),
+            "table_claims": len(evidence.table_claims or []),
+            "visual_claims": len(evidence.visual_claims or []),
+            "product_only_text_blocks": len(evidence.product_only_text_blocks or []),
+            "product_only_text_chars": product_text_chars,
+            "downloaded_images": len(downloaded_images),
+            "vision_described_images": len(described_images),
+            "image_download_errors": len(download_errors),
+            "image_http_403_errors": len(download_403),
+            "tables": len(tables),
+            "json_ld_blocks": len(page.json_ld or []),
+        },
+        "access": {
+            "access_status": result.access_status,
+            "browser_visible": result.browser_visible,
+            "product_details_recovered": result.product_details_recovered,
+            "recovery_status": result.recovery_status,
+            "proxy_used": result.proxy_used,
+            "geo_restricted": result.geo_restricted,
+        },
+        "recommended_followups": list(dict.fromkeys(recommended_followups)),
+        "policy": "Quality gate audits artifact completeness only; it does not add facts or use external knowledge.",
+    }
+
 def synthesize_claims_md_from_evidence(evidence: ProductEvidence) -> str:
     """Use LLM to turn normalized evidence JSON into the final claims.md."""
     from .services.llm import get_llm_service
@@ -618,6 +754,7 @@ __all__ = [
     "evidence_axes_from_product_evidence",
     "deterministic_product_details_recovered",
     "build_evidence_recovery_report",
+    "build_artifact_quality_report",
     "render_product_evidence_md",
     "build_noise_report",
     "synthesize_claims_md_from_evidence",

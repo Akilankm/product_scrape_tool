@@ -1,7 +1,7 @@
 [project]
 name = "product-scraping-agent"
 version = "1.1.5"
-description = "Agentic URL-in product evidence recovery agent with Crawl4AI, vision, and upstream evidence support."
+description = "Agentic URL-in product quality-hardened evidence recovery agent with Crawl4AI, vision, and upstream evidence support."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "crawl4ai>=0.8",

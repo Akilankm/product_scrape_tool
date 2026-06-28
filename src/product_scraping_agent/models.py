@@ -8,7 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .text_utils import digits_only
-from .url_analysis import URLAnalysis
 
 _DTO_CONFIG = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -153,18 +152,12 @@ class ScrapeRequest(BaseModel):
     strict_product_only: bool = True
     write_raw_debug: bool | None = None
 
-    # Native proxy routing controls. The proxy mechanism is built in, but actual
-    # endpoint/credentials must come from request/env/YAML/secret injection.
-    proxy_url: str = ""
-    proxy_country_code: str = ""
-    enable_proxy_retry: bool = True
-
     @field_validator("ean")
     @classmethod
     def normalize_ean(cls, value: str) -> str:
         return digits_only(value)
 
-    @field_validator("country_code", "proxy_country_code")
+    @field_validator("country_code")
     @classmethod
     def normalize_country(cls, value: str) -> str:
         return (value or "").strip().upper()
@@ -214,6 +207,8 @@ class ImageRef(BaseModel):
     description: str = ""
     relevance: str = ""
     error: str = ""
+    download_source: str = ""
+    download_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TableRef(BaseModel):
@@ -256,8 +251,6 @@ class ScrapeResult(BaseModel):
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
-    url_analysis: URLAnalysis | None = None
-    proxy_plan: dict[str, Any] = Field(default_factory=dict)
 
     request_json_path: Path | None = None
     scrape_result_json_path: Path | None = None
@@ -272,6 +265,7 @@ class ScrapeResult(BaseModel):
     product_evidence_json_path: Path | None = None
     noise_report_json_path: Path | None = None
     evidence_recovery_report_json_path: Path | None = None
+    quality_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -350,8 +344,6 @@ class ScrapedProduct(BaseModel):
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
-    url_analysis: URLAnalysis | None = None
-    proxy_plan: dict[str, Any] = Field(default_factory=dict)
 
     raw_markdown: str = ""
     raw_html: str = ""
@@ -373,6 +365,7 @@ class ScrapedProduct(BaseModel):
     product_evidence_json_path: Path | None = None
     noise_report_json_path: Path | None = None
     evidence_recovery_report_json_path: Path | None = None
+    quality_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -405,8 +398,6 @@ class ScrapedProduct(BaseModel):
             evidence_axes_used=self.evidence_axes_used,
             input_context=self.input_context,
             upstream_evidence=self.upstream_evidence,
-            url_analysis=self.url_analysis,
-            proxy_plan=self.proxy_plan,
             request_json_path=self.request_json_path,
             scrape_result_json_path=self.scrape_result_json_path,
             source_md_path=self.source_md_path,
@@ -420,6 +411,7 @@ class ScrapedProduct(BaseModel):
             product_evidence_json_path=self.product_evidence_json_path,
             noise_report_json_path=self.noise_report_json_path,
             evidence_recovery_report_json_path=self.evidence_recovery_report_json_path,
+            quality_report_json_path=self.quality_report_json_path,
             agent_trace_json_path=self.agent_trace_json_path,
             raw_debug_dir=self.raw_debug_dir,
             image_count=len(self.images),
@@ -435,7 +427,6 @@ class ScrapedProduct(BaseModel):
 
 __all__ = [
     "ProductInputContext",
-    "URLAnalysis",
     "EvidenceSourceItem",
     "UpstreamEvidenceBundle",
     "ScrapeRequest",

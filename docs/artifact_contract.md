@@ -19,16 +19,13 @@ Optional:
   "retailer_name": "Retailer name",
   "country_code": "CZ",
   "product_hint": "override context shown to image/planner/evidence LLM",
-  "proxy_url": "optional runtime/secret-provided proxy endpoint",
-  "proxy_country_code": "optional proxy target override",
-  "enable_proxy_retry": true,
   "upstream_ai_evidence": "optional AI/search evidence already produced upstream",
   "candidate_snippets": ["optional indexed/search snippets already produced upstream"],
   "search_evidence": [{"source_type": "serp", "title": "", "url": "", "text": ""}]
 }
 ```
 
-`product_url` is the primary input. Optional context is not search input and is not retailer truth. It is used for decision trace, validation, locale/proxy routing, image relevance, same-page evidence planning, and product-only normalization. Optional upstream evidence is also not searched by this agent; it is only consumed when already produced by the discovery layer and is tagged as `A` evidence.
+Optional context is not search input. It is used for provenance, image relevance, same-page evidence planning, and product-only normalization. Optional upstream evidence is also not searched by this agent; it is only consumed when already produced by the discovery layer and is tagged as `A` evidence.
 
 ## Output folder
 
@@ -49,6 +46,7 @@ vision.md
 metadata.json
 noise_report.json
 evidence_recovery_report.json
+quality_report.json
 tables/
 images/
 manifests/agent_trace.json
@@ -65,24 +63,8 @@ manifests/artifact_manifest.json
 - `source.md` contains product-only text blocks, not full raw page markdown.
 - `noise_report.json` records the exclusion policy without storing raw noisy text.
 - `evidence_recovery_report.json` explains whether browser access was visible, whether product details were recovered, and which evidence axes were used.
+- `quality_report.json` is a deterministic acceptance gate for downstream product coding. It reports `strong`, `usable`, `partial`, or `insufficient`, plus missing critical fields and warnings.
 - `debug_raw/` is disabled by default and only exists if explicitly enabled.
-
-## URL-first decision trace
-
-Before scraping, the agent decomposes the URL and writes `url_analysis` to `request.json`, `metadata.json`, `product_evidence.json` quality metadata, and `manifests/agent_trace.json`. It captures:
-
-```text
-domain / retailer domain
-URL country and language hints
-slug tokens
-product-id/SKU candidates
-main_text vs URL slug overlap
-EAN presence in URL
-retailer_name vs domain consistency
-country_code vs URL hint consistency
-```
-
-These signals guide planning only. The URL remains primary.
 
 ## Agentic same-page loop
 
@@ -133,15 +115,7 @@ Fields written to `metadata.json`, `scrape_result.json`, `artifact_manifest.json
 }
 ```
 
-Proxy orchestration is native. The actual proxy endpoint/credentials remain external and can come from request override, `.env`, YAML, AzureML secret injection, or Key Vault-backed environment variables. If `PCA_PROXY_URL_<COUNTRY>` or `PCA_PROXY_URL` is configured, the same URL is retried through that authorised egress path. Search/discovery is still not performed by this agent.
-
-Proxy target priority:
-
-```text
-1. proxy_country_code request override
-2. country_code supporting context
-3. URL country hint from the domain
-```
+When `PCA_GEO_PROXY_ENABLED=true` and a proxy is configured through `PCA_PROXY_URL_<COUNTRY>` or `PCA_PROXY_URL`, the same URL is retried through that authorised egress path. Search/discovery is still not performed by this agent.
 
 ## Evidence recovery contract
 
@@ -172,3 +146,31 @@ I = user input context
 ```
 
 If no browser, metadata, image, table, or upstream evidence is available, the agent must report insufficient evidence and must not invent product facts.
+
+
+## Quality gate contract
+
+`quality_report.json` is written for every run. It does not add facts; it audits whether the artifact is safe to hand to downstream product coding.
+
+Example:
+
+```json
+{
+  "artifact_quality": "usable",
+  "quality_score": 78,
+  "requires_manual_review": false,
+  "missing_critical_fields": [],
+  "warnings": ["3 image candidate(s) failed with HTTP 403; CDN recovery may be partial"],
+  "evidence_axes_used": ["T", "D", "V", "S"],
+  "recommended_followups": []
+}
+```
+
+Quality labels:
+
+```text
+strong       = rich multi-axis evidence; safe for downstream coding
+usable       = sufficient evidence with minor warnings
+partial      = usable only with review or supplemental evidence
+insufficient = do not code automatically; evidence is too weak
+```

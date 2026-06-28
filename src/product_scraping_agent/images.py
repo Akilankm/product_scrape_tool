@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from PIL import Image
@@ -87,33 +89,151 @@ def _should_skip(url: str, alt: str) -> bool:
 # ----------------------------------------------------------------------
 # Download
 # ----------------------------------------------------------------------
+def _origin_from_url(url: str) -> str:
+    try:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+    except Exception:
+        return ""
+
+
+def _strip_query(url: str) -> str:
+    try:
+        p = urlparse(url)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
+    except Exception:
+        return url
+
+
+def _image_headers(*, referer: str, image_url: str, strategy: str) -> dict[str, str]:
+    """Build progressively stronger CDN-friendly image request headers."""
+    headers = dict(BROWSER_HEADERS)
+    headers.update({
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": referer or _origin_from_url(image_url),
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+    })
+    accept_language = os.getenv("PCA_IMAGE_ACCEPT_LANGUAGE") or os.getenv("PCA_ACCEPT_LANGUAGE") or ""
+    if accept_language:
+        headers["Accept-Language"] = accept_language
+    if strategy == "origin_referer":
+        origin = _origin_from_url(referer) or _origin_from_url(image_url)
+        if origin:
+            headers["Referer"] = origin + "/"
+            headers["Origin"] = origin
+    elif strategy == "same_origin_referer":
+        origin = _origin_from_url(image_url)
+        if origin:
+            headers["Referer"] = origin + "/"
+            headers["Origin"] = origin
+    elif strategy == "no_referer":
+        headers.pop("Referer", None)
+        headers.pop("Origin", None)
+        headers["Sec-Fetch-Site"] = "none"
+    return headers
+
+
+async def _try_playwright_request(url: str, *, headers: dict[str, str], timeout: float) -> tuple[int, bytes, dict[str, str], str]:
+    """Last-resort image fetch through Playwright's request stack.
+
+    This does not bypass access controls; it only helps with CDNs that reject
+    plain HTTP clients but accept browser-shaped requests. It is intentionally
+    optional and best-effort because Crawl4AI already brings Playwright in most
+    runtime environments.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - depends on optional runtime
+        return 0, b"", {}, f"playwright unavailable: {type(exc).__name__}: {exc}"
+    try:
+        async with async_playwright() as pw:
+            ctx = await pw.request.new_context(extra_http_headers=headers)
+            try:
+                resp = await ctx.get(url, timeout=timeout * 1000)
+                body = await resp.body()
+                return resp.status, body, {k.lower(): v for k, v in resp.headers.items()}, "playwright_request"
+            finally:
+                await ctx.dispose()
+    except Exception as exc:  # noqa: BLE001
+        return 0, b"", {}, f"playwright_request {type(exc).__name__}: {exc}"
+
+
 async def _download_one(
     client: httpx.AsyncClient, url: str, alt: str, referer: str, idx: int,
     images_dir: Path,
 ) -> ImageRef:
     ref = ImageRef(url=url, alt=alt)
-    try:
-        r = await client.get(
-            url,
-            headers={**BROWSER_HEADERS, "Referer": referer},
-            follow_redirects=True,
-        )
-    except Exception as exc:
-        ref.error = f"{type(exc).__name__}: {exc}"
-        return ref
+    timeout = float(os.getenv("PCA_IMAGE_DOWNLOAD_TIMEOUT", "20") or "20")
+    retry_enabled = os.getenv("PCA_IMAGE_RETRY_STRATEGIES_ENABLED", "1").lower() in {"1", "true", "yes", "y", "on"}
+    strip_query_retry = os.getenv("PCA_IMAGE_RETRY_STRIP_QUERY", "0").lower() in {"1", "true", "yes", "y", "on"}
+    browser_fallback = os.getenv("PCA_IMAGE_BROWSER_REQUEST_FALLBACK", "1").lower() in {"1", "true", "yes", "y", "on"}
 
-    if r.status_code != 200:
-        ref.error = f"http {r.status_code}"
-        return ref
-    data = r.content
+    attempts: list[tuple[str, str, dict[str, str]]] = [
+        ("referer", url, _image_headers(referer=referer, image_url=url, strategy="referer")),
+    ]
+    if retry_enabled:
+        attempts.extend([
+            ("origin_referer", url, _image_headers(referer=referer, image_url=url, strategy="origin_referer")),
+            ("same_origin_referer", url, _image_headers(referer=referer, image_url=url, strategy="same_origin_referer")),
+            ("no_referer", url, _image_headers(referer=referer, image_url=url, strategy="no_referer")),
+        ])
+        if strip_query_retry and "?" in url:
+            stripped = _strip_query(url)
+            if stripped and stripped != url:
+                attempts.append(("strip_query", stripped, _image_headers(referer=referer, image_url=stripped, strategy="referer")))
+
+    data = b""
+    headers: dict[str, str] = {}
+    status_code = 0
+    source = ""
+    last_error = ""
+
+    for name, candidate_url, hdrs in attempts:
+        try:
+            r = await client.get(candidate_url, headers=hdrs, follow_redirects=True, timeout=timeout)
+            status_code = int(r.status_code)
+            headers = {k.lower(): v for k, v in r.headers.items()}
+            ref.download_attempts.append({
+                "strategy": name,
+                "url_changed": candidate_url != url,
+                "status": status_code,
+                "bytes": len(r.content or b""),
+            })
+            if r.status_code == 200 and r.content:
+                data = r.content
+                source = name
+                break
+            last_error = f"http {r.status_code}"
+            if r.status_code not in {401, 403, 404, 408, 429, 500, 502, 503, 504}:
+                break
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            ref.download_attempts.append({"strategy": name, "status": 0, "error": last_error[:300]})
+
+    if not data and browser_fallback and retry_enabled and last_error.startswith("http 403"):
+        hdrs = _image_headers(referer=referer, image_url=url, strategy="referer")
+        status_code, data, headers, source_or_error = await _try_playwright_request(url, headers=hdrs, timeout=timeout)
+        ref.download_attempts.append({
+            "strategy": "playwright_request",
+            "status": status_code,
+            "bytes": len(data or b""),
+            "error": "" if data and status_code == 200 else source_or_error[:300],
+        })
+        if data and status_code == 200:
+            source = "playwright_request"
+        elif source_or_error:
+            last_error = source_or_error
+
     if not data:
-        ref.error = "empty body"
+        ref.error = last_error or f"http {status_code}" if status_code else "download failed"
         return ref
     if len(data) > _MAX_BYTES:
         ref.error = f"too large ({len(data)} bytes)"
         return ref
 
-    mime = r.headers.get("content-type", "").split(";")[0].strip().lower()
+    mime = (headers.get("content-type", "") or "").split(";")[0].strip().lower()
     ext = IMAGE_MIME_EXT.get(mime, "")
     sha8 = hashlib.sha1(data).hexdigest()[:8]
 
@@ -144,6 +264,7 @@ async def _download_one(
     ref.mime = mime or ""
     ref.width = width
     ref.height = height
+    ref.download_source = source or "http"
     return ref
 
 
@@ -276,12 +397,15 @@ async def _classify_relevance(ref: ImageRef, product_hint: str) -> None:
 def _vision_relevance_batch_sync(
     thumbs: list[str], alts: list[str], product_hint: str,
 ) -> list[str]:
-    """Classify a batch of images in one vision call. Returns one
-    'yes'/'no'/'' verdict per input thumbnail in the SAME order.
+    """Classify a batch of images in one vision call.
 
-    On payload-too-large gateway errors (HTTP 403/413/429) returns a
-    list whose first element is the sentinel ``"__OVERSIZE__"``; the
-    async wrapper uses this to halve ``batch_size`` and retry.
+    Returns one 'yes'/'no'/'' verdict per input thumbnail in the SAME order.
+
+    Gateway errors are classified carefully:
+    * 413 / request_too_large -> ``__OVERSIZE__`` so the wrapper halves the batch.
+    * 401/403 Forbidden -> ``__BATCH_UNSUPPORTED__`` so the wrapper stops
+      batch retries and falls back to rich per-image vision.
+    * 429/5xx -> ``__TEMPFAIL__`` so the wrapper avoids noisy retry storms.
     """
     if not thumbs:
         return []
@@ -323,19 +447,22 @@ def _vision_relevance_batch_sync(
         text = (resp.content or "").strip()
     except Exception as exc:
         msg = str(exc)
-        # Detect oversized-payload signals from the gateway. Sentinel
-        # tells the async wrapper to halve the batch and retry. Only
-        # meaningful when the batch has >1 image (otherwise we'd retry
-        # forever).
-        oversize = (
-            n > 1 and any(s in msg for s in (
-                "403", "413", "429", "Forbidden", "too large",
-                "Payload Too Large", "request_too_large",
-            ))
-        )
+        lower = msg.lower()
+        # Important: corporate gateways often return 403 for disallowed
+        # multimodal batch shape, not payload oversize. Do not burn calls
+        # retrying 8→4→2→1 on a hard authorization/schema rejection.
+        oversize = n > 1 and any(s in lower for s in (
+            "413", "payload too large", "request_too_large", "too large", "maximum content",
+        ))
+        hard_forbidden = any(s in lower for s in ("403", "401", "forbidden", "unauthorized"))
+        transient = any(s in lower for s in ("429", "rate limit", "timeout", "temporarily", "500", "502", "503", "504"))
         logger.warning("vision relevance batch failed (n={}): {}", n, exc)
+        if hard_forbidden:
+            return ["__BATCH_UNSUPPORTED__"] + [""] * (n - 1)
         if oversize:
             return ["__OVERSIZE__"] + [""] * (n - 1)
+        if transient:
+            return ["__TEMPFAIL__"] + [""] * (n - 1)
         return [""] * n
 
     # Parse "i: yes/no" lines (loose — model may add markdown bullets).
@@ -402,6 +529,23 @@ async def _classify_relevance_batched(
             verdicts = await asyncio.to_thread(
                 _vision_relevance_batch_sync, thumbs_b, alts_b, product_hint,
             )
+            if verdicts and verdicts[0] == "__BATCH_UNSUPPORTED__":
+                logger.warning(
+                    "  relevance   : batch vision relevance unsupported/forbidden by gateway; "
+                    "disabling batch relevance for this run"
+                )
+                for r in refs_b:
+                    r.relevance = ""
+                return
+            if verdicts and verdicts[0] == "__TEMPFAIL__":
+                logger.warning(
+                    "  relevance   : batch vision relevance transient failure; "
+                    "leaving {} image(s) unverified for rich-vision fallback",
+                    len(refs_b),
+                )
+                for r in refs_b:
+                    r.relevance = ""
+                return
             if verdicts and verdicts[0] == "__OVERSIZE__":
                 # Stash for retry at smaller bsize. Don't touch
                 # ref.relevance — keep it as-is (probably "").
@@ -446,7 +590,7 @@ async def _classify_relevance_batched(
             )
             break
         logger.warning(
-            "  relevance   : gateway oversize on batch={} → retrying {} "
+            "  relevance   : payload too large on batch={} → retrying {} "
             "image(s) at batch={}",
             bsize, len(retry), new_bsize,
         )
@@ -673,7 +817,10 @@ async def download_and_describe(
     # Adaptive: starts at PCA_RELEVANCE_BATCH (default 8); if the
     # gateway returns HTTP 403/413/429 (payload too large), the batch
     # is automatically halved (8 → 4 → 2 → 1) and retried.
-    rel_batch = max(1, int(_os.getenv("PCA_RELEVANCE_BATCH", "8")))
+    batch_enabled = _os.getenv("PCA_RELEVANCE_BATCH_ENABLED", "1").lower() in (
+        "1", "true", "yes", "y", "on"
+    )
+    rel_batch = 1 if not batch_enabled else max(1, int(_os.getenv("PCA_RELEVANCE_BATCH", "8")))
 
     t_rel = _time.monotonic()
     if rel_batch == 1:

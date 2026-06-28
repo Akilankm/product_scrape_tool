@@ -17,10 +17,7 @@ from urllib.parse import urljoin
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import Config
-from .models import ProductInputContext
-from .proxy_router import ProxyPlan, resolve_proxy_plan
-from .url_analysis import URLAnalysis, analyze_product_url
+from .config import Config, accept_language_for_country, proxy_url_for_country
 from .log import logger
 from .services.scraper import (
     _CANONICAL_RE,
@@ -356,17 +353,7 @@ def _profile_js(profile: str) -> str | None:
 """
 
 
-async def fetch_full(
-    cfg: Config,
-    url: str,
-    *,
-    profile: str = "standard",
-    country_code: str = "",
-    url_analysis: URLAnalysis | None = None,
-    proxy_url: str = "",
-    proxy_country_code: str = "",
-    enable_proxy_retry: bool = True,
-) -> FullPage:
+async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", country_code: str = "") -> FullPage:
     """Render a product URL with Crawl4AI and extract text/html/images/tables."""
     try:
         from crawl4ai import CacheMode
@@ -376,18 +363,6 @@ async def fetch_full(
     base_timeout_ms = int(cfg.scrape_timeout * 1000)
     env_scan_full = os.getenv("PCA_SCAN_FULL_PAGE", "0").lower() in {"1", "true", "yes"}
     scan_full = env_scan_full or profile in {"full_page_scroll", "expand_common_sections", "extract_gallery_sources"}
-
-    analysis = url_analysis or analyze_product_url(url, country_code=country_code)
-    input_context = ProductInputContext(country_code=country_code)
-    proxy_plan: ProxyPlan = resolve_proxy_plan(
-        cfg,
-        url_analysis=analysis,
-        input_context=input_context,
-        proxy_url_override=proxy_url,
-        proxy_country_code=proxy_country_code,
-        enable_proxy_retry=enable_proxy_retry,
-    )
-    target_country_code = proxy_plan.target_country_code or (country_code or "").strip().upper()
 
     def _mk_run_cfg(timeout_ms: int, *, last_ditch: bool = False, proxy_url: str = ""):
         kwargs = {
@@ -404,8 +379,9 @@ async def fetch_full(
         }
         if proxy_url:
             kwargs["proxy_config"] = proxy_url
-        if proxy_plan.accept_language:
-            kwargs["headers"] = {"Accept-Language": proxy_plan.accept_language}
+        lang = accept_language_for_country(country_code)
+        if lang:
+            kwargs["headers"] = {"Accept-Language": lang}
         js = _profile_js(profile)
         if js and not last_ditch:
             kwargs["js_code"] = js
@@ -455,10 +431,8 @@ async def fetch_full(
             "attempt": name,
             "profile": profile,
             "proxy_used": bool(proxy_url),
-            "proxy_source": proxy_plan.proxy_source if proxy_url else "direct",
-            "target_country_code": target_country_code,
-            "accept_language": proxy_plan.accept_language,
-            "url_country_hint": analysis.url_country_hint,
+            "proxy_source": _proxy_label(proxy_url, country_code),
+            "target_country_code": (country_code or "").strip().upper(),
             "status": status,
             "success": success,
             "html_chars": len(html_text or ""),
@@ -483,21 +457,20 @@ async def fetch_full(
     # Geo/access-aware escalation: direct failure must not be interpreted as product absence.
     status, html_text, md_text, error_text, _success = _result_texts(result)
     issue_type, reason, is_geo = _classify_access_issue(status, html_text, md_text, error_text)
-    routed_proxy_url = proxy_plan.proxy_url if proxy_plan.enabled else ""
+    proxy_url = proxy_url_for_country(country_code) if cfg.geo_proxy_enabled else ""
     should_proxy_retry = (
         cfg.geo_retry_on_access_block
-        and proxy_plan.enabled
-        and bool(routed_proxy_url)
+        and bool(proxy_url)
         and issue_type in {"geo_restricted", "access_denied", "bot_challenge", "rate_limited", "fetch_error"}
     )
     if should_proxy_retry:
         logger.warning(
             "full_scraper[{}]: access issue detected ({}); retrying with configured target-country proxy ({})",
-            profile, issue_type, proxy_plan.proxy_source,
+            profile, issue_type, _proxy_label(proxy_url, country_code),
         )
-        results = await _attempt(base_timeout_ms * 2, proxy_url=routed_proxy_url)
+        results = await _attempt(base_timeout_ms * 2, proxy_url=proxy_url)
         proxy_result = results[0] if results else None
-        _append_attempt("geo_proxy_retry", proxy_result, proxy_url=routed_proxy_url)
+        _append_attempt("geo_proxy_retry", proxy_result, proxy_url=proxy_url)
         p_status, p_html, p_md, p_error, p_success = _result_texts(proxy_result)
         p_issue, _p_reason, _p_geo = _classify_access_issue(p_status, p_html, p_md, p_error)
         if proxy_result is not None and (p_success or p_html or p_md) and p_issue not in {"geo_restricted", "access_denied", "bot_challenge"}:
@@ -506,7 +479,7 @@ async def fetch_full(
     if _transient(result) or profile == "retry_relaxed":
         logger.warning("full_scraper[{}]: last-ditch DOM grab for {}", profile, url)
         # Use the configured proxy for the relaxed grab only if direct access already showed an access issue.
-        relaxed_proxy = routed_proxy_url if routed_proxy_url and issue_type in {"geo_restricted", "access_denied", "bot_challenge"} else ""
+        relaxed_proxy = proxy_url if proxy_url and issue_type in {"geo_restricted", "access_denied", "bot_challenge"} else ""
         results = await _attempt(15_000, last_ditch=True, proxy_url=relaxed_proxy)
         relaxed_result = results[0] if results else None
         _append_attempt("last_ditch", relaxed_result, proxy_url=relaxed_proxy)

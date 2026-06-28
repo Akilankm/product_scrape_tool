@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .agentic import (
+    build_artifact_quality_report,
     build_evidence_recovery_report,
     build_noise_report,
     deterministic_product_evidence,
@@ -32,8 +33,6 @@ from .agentic import (
     synthesize_claims_md_from_evidence,
 )
 from .config import Config, get_config
-from .proxy_router import resolve_proxy_plan
-from .url_analysis import URLAnalysis, analyze_product_url
 from .full_scraper import FullPage, fetch_full, merge_full_pages, table_html_to_markdown
 from .images import download_and_describe
 from .log import logger
@@ -136,16 +135,9 @@ def _metadata_payload(
     input_context: ProductInputContext,
     product_hint: str,
     upstream_evidence: UpstreamEvidenceBundle,
-    url_analysis: URLAnalysis,
-    proxy_plan: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "primary_input": {"product_url": page.url},
-        "supporting_context": input_context.model_dump(),
         "input_context": input_context.model_dump(),
-        "url_analysis": url_analysis.model_dump(),
-        "proxy_plan": proxy_plan,
-        "context_policy": "product_url is primary; main_text/EAN/retailer_name/country_code are supporting planning/validation context only",
         "upstream_evidence_present": upstream_evidence.has_any(),
         "upstream_evidence": upstream_evidence.compact(max_chars=12_000) if upstream_evidence.has_any() else {},
         "product_hint": product_hint,
@@ -196,6 +188,8 @@ def _image_manifest(images: list[ImageRef], out_dir: Path) -> list[dict[str, Any
             "description_available": bool(img.description),
             "description": img.description,
             "error": img.error,
+            "download_source": img.download_source,
+            "download_attempts": img.download_attempts,
         })
     return rows
 
@@ -224,19 +218,13 @@ def _artifact_manifest(
     images: list[ImageRef],
     tables: list[TableRef],
     evidence: ProductEvidence | None,
-    url_analysis: URLAnalysis | None = None,
-    proxy_plan: dict[str, Any] | None = None,
+    quality_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     quality = evidence.quality if evidence else {}
     return {
-        "artifact_version": "product_scrape.v5.url_first_evidence_recovery",
+        "artifact_version": "product_scrape.v5.quality_hardened",
         "scrape_id": scrape_id,
-        "primary_input": {"product_url": result.url},
-        "supporting_context": input_context.model_dump(),
         "input_context": input_context.model_dump(),
-        "url_analysis": url_analysis.model_dump() if url_analysis else {},
-        "proxy_plan": proxy_plan or result.proxy_plan,
-        "context_policy": "URL-first artifact: optional fields support trace, locale/proxy planning, relevance checks, and validation only",
         "product_hint": product_hint,
         "product_url": result.url,
         "final_url": result.final_url,
@@ -262,6 +250,7 @@ def _artifact_manifest(
             "metadata_json": _safe_rel(result.metadata_json_path, out_dir),
             "noise_report_json": _safe_rel(result.noise_report_json_path, out_dir),
             "evidence_recovery_report_json": _safe_rel(result.evidence_recovery_report_json_path, out_dir),
+            "quality_report_json": _safe_rel(result.quality_report_json_path, out_dir),
             "agent_trace_json": _safe_rel(result.agent_trace_json_path, out_dir),
             "image_manifest_json": _safe_rel(result.image_manifest_path, out_dir),
             "table_manifest_json": _safe_rel(result.table_manifest_path, out_dir),
@@ -274,6 +263,8 @@ def _artifact_manifest(
             "image_candidates": len(images),
             "images_downloaded": sum(1 for i in images if i.local_path),
             "images_described": sum(1 for i in images if i.description),
+            "image_download_errors": sum(1 for i in images if i.error),
+            "image_cdn_403_errors": sum(1 for i in images if "403" in (i.error or "")),
             "tables": len(tables),
             "json_ld_blocks": len(result.json_ld),
             "agent_iterations": result.agent_iterations,
@@ -298,10 +289,41 @@ def _artifact_manifest(
             "proxy_used": result.proxy_used,
             "recovery_status": result.recovery_status,
             "evidence_axes_used": result.evidence_axes_used,
+            "quality_gate": (quality_report or {}).get("artifact_quality", "not_evaluated"),
+            "requires_manual_review": bool((quality_report or {}).get("requires_manual_review", False)),
+            "missing_critical_fields": (quality_report or {}).get("missing_critical_fields", []),
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+
+
+
+def _deterministic_followup_action(page: FullPage, used_actions: dict[str, int]) -> tuple[str, str] | None:
+    """Safety-net planner when the LLM says stop too early.
+
+    The LLM remains the brain, but the artifact contract needs deterministic
+    guardrails: if the capture is clearly thin, do one same-URL expansion before
+    downstream normalization. This never searches and never changes URL.
+    """
+    md_chars = len(page.raw_markdown or "")
+    html_chars = len(page.raw_html or "")
+    image_count = len(page.images or [])
+    table_count = len(page.tables_html or [])
+    jsonld_count = len(page.json_ld or [])
+
+    def available(action: str) -> bool:
+        return action in _ALLOWED_ACTIONS and used_actions.get(action, 0) < _MAX_REPEAT_ACTIONS
+
+    if page.access_status != "accessible" and available("retry_relaxed"):
+        return "retry_relaxed", "direct capture has access/visibility weakness; retry relaxed same-URL profile"
+    if md_chars < 5_000 and html_chars > md_chars * 3 and available("expand_common_sections"):
+        return "expand_common_sections", "rendered markdown is thin compared with HTML; expand common product sections"
+    if md_chars < 8_000 and table_count == 0 and jsonld_count == 0 and available("full_page_scroll"):
+        return "full_page_scroll", "low text plus no structured/table evidence; perform full-page scroll"
+    if image_count < 3 and available("extract_gallery_sources"):
+        return "extract_gallery_sources", "few image candidates detected; probe same-page gallery/source attributes"
+    return None
 
 async def _agentic_fetch_loop(
     cfg: Config,
@@ -310,30 +332,14 @@ async def _agentic_fetch_loop(
     input_context: ProductInputContext,
     product_hint: str,
     max_iterations: int,
-    url_analysis: URLAnalysis,
-    proxy_url: str = "",
-    proxy_country_code: str = "",
-    enable_proxy_retry: bool = True,
 ) -> tuple[FullPage, list[dict[str, Any]]]:
-    """Initial scrape plus URL-first, LLM-planned same-page follow-up passes."""
+    """Initial scrape plus LLM-planned same-page follow-up passes."""
     trace: list[dict[str, Any]] = []
-    trace.append({
-        "iteration": -1,
-        "stage": "url_first_planning_context",
-        "primary_input": {"product_url": url},
-        "url_analysis": url_analysis.model_dump(),
-        "supporting_context": input_context.model_dump(),
-        "policy": "product_url is primary; optional inputs are supporting planning/validation/routing context only",
-    })
-    page = await fetch_full(
-        cfg, url, profile="standard", country_code=input_context.country_code,
-        url_analysis=url_analysis, proxy_url=proxy_url, proxy_country_code=proxy_country_code,
-        enable_proxy_retry=enable_proxy_retry,
-    )
+    page = await fetch_full(cfg, url, profile="standard", country_code=input_context.country_code)
     trace.append({
         "iteration": 0,
         "profile": "standard",
-        "reason": "initial URL-anchored capture",
+        "reason": "initial capture",
         "counts": {
             "markdown_chars": len(page.raw_markdown or ""),
             "html_chars": len(page.raw_html or ""),
@@ -343,20 +349,15 @@ async def _agentic_fetch_loop(
         },
         "success": page.success,
         "status": page.status,
-        "access_status": page.access_status,
-        "proxy_used": page.proxy_used,
-        "proxy_source": page.proxy_source,
     })
 
-    # Even if the browser is blocked, the planner trace now records URL/context analysis.
-    # Evidence recovery can continue later from metadata/upstream evidence without claiming product absence.
     if not (cfg.agentic_enabled and cfg.llm_enabled) or max_iterations <= 0 or not page.success:
         return page, trace
 
     used_actions: dict[str, int] = {}
     for iteration in range(1, max_iterations + 1):
         try:
-            plan = await asyncio.to_thread(plan_next_actions, page, input_context, product_hint, url_analysis)
+            plan = await asyncio.to_thread(plan_next_actions, page, input_context, product_hint)
         except Exception as exc:
             logger.warning("agent planner failed at iteration {}: {}", iteration, exc)
             trace.append({"iteration": iteration, "planner_error": f"{type(exc).__name__}: {exc}", "stopped": True})
@@ -364,13 +365,35 @@ async def _agentic_fetch_loop(
 
         action_items = [a for a in plan.actions if a.action in _ALLOWED_ACTIONS]
         if plan.enough_evidence or not action_items:
+            deterministic = _deterministic_followup_action(page, used_actions)
+            if deterministic is None:
+                trace.append({
+                    "iteration": iteration,
+                    "plan": plan.model_dump(),
+                    "stopped": True,
+                    "stop_reason": plan.stop_reason or "planner reported enough evidence or no allowed action",
+                })
+                break
+            action, reason = deterministic
+            logger.info(
+                "  agent guardrail : iteration={} action={} reason={}",
+                iteration, action, reason[:180],
+            )
+            used_actions[action] = used_actions.get(action, 0) + 1
+            followup = await fetch_full(cfg, url, profile=action, country_code=input_context.country_code)
+            before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
+            page = merge_full_pages(page, followup)
+            after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
             trace.append({
                 "iteration": iteration,
                 "plan": plan.model_dump(),
-                "stopped": True,
-                "stop_reason": plan.stop_reason or "planner reported enough evidence or no allowed action",
+                "deterministic_guardrail": {"action": action, "reason": reason},
+                "followup_success": followup.success,
+                "followup_status": followup.status,
+                "before_counts": {"markdown_chars": before[0], "images": before[1], "tables": before[2], "json_ld": before[3]},
+                "after_counts": {"markdown_chars": after[0], "images": after[1], "tables": after[2], "json_ld": after[3]},
             })
-            break
+            continue
 
         action_items = sorted(action_items, key=lambda a: a.priority)
         chosen = None
@@ -389,11 +412,7 @@ async def _agentic_fetch_loop(
 
         used_actions[chosen.action] = used_actions.get(chosen.action, 0) + 1
         logger.info("  agent plan : iteration={} action={} reason={}", iteration, chosen.action, chosen.reason[:180])
-        followup = await fetch_full(
-            cfg, url, profile=chosen.action, country_code=input_context.country_code,
-            url_analysis=url_analysis, proxy_url=proxy_url, proxy_country_code=proxy_country_code,
-            enable_proxy_retry=enable_proxy_retry,
-        )
+        followup = await fetch_full(cfg, url, profile=chosen.action, country_code=input_context.country_code)
         before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
         page = merge_full_pages(page, followup)
         after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
@@ -403,7 +422,6 @@ async def _agentic_fetch_loop(
             "executed_action": chosen.model_dump(),
             "followup_success": followup.success,
             "followup_status": followup.status,
-            "followup_access_status": followup.access_status,
             "before_counts": {"markdown_chars": before[0], "images": before[1], "tables": before[2], "json_ld": before[3]},
             "after_counts": {"markdown_chars": after[0], "images": after[1], "tables": after[2], "json_ld": after[3]},
         })
@@ -454,9 +472,6 @@ async def scrape_product(
     max_agent_iterations: int | None = None,
     strict_product_only: bool = True,
     write_raw_debug: bool | None = None,
-    proxy_url: str = "",
-    proxy_country_code: str = "",
-    enable_proxy_retry: bool = True,
 ) -> ScrapedProduct:
     """Scrape one known product URL into a noise-free product evidence artifact.
 
@@ -473,23 +488,7 @@ async def scrape_product(
         country_code=country_code.strip(),
     )
     upstream_bundle = upstream_evidence or UpstreamEvidenceBundle()
-    resolved_hint = (product_hint or "").strip() or input_context.compact_hint(fallback=url)
-    url_analysis = analyze_product_url(
-        url,
-        main_text=input_context.main_text,
-        ean=input_context.ean,
-        retailer_name=input_context.retailer_name,
-        country_code=input_context.country_code,
-    )
-    proxy_plan_obj = resolve_proxy_plan(
-        cfg,
-        url_analysis=url_analysis,
-        input_context=input_context,
-        proxy_url_override=proxy_url,
-        proxy_country_code=proxy_country_code,
-        enable_proxy_retry=enable_proxy_retry,
-    )
-    proxy_plan = proxy_plan_obj.model_dump(exclude={"proxy_url"}) | {"proxy_endpoint_configured": bool(proxy_plan_obj.proxy_url)}
+    resolved_hint = (product_hint or "").strip() or input_context.compact_hint()
     out_root = output_root or cfg.output_root
     started = datetime.now(timezone.utc)
     t0 = started.timestamp()
@@ -511,6 +510,7 @@ async def scrape_product(
     metadata_path = out_dir / "metadata.json"
     noise_report_path = out_dir / "noise_report.json"
     evidence_recovery_report_path = out_dir / "evidence_recovery_report.json"
+    quality_report_path = out_dir / "quality_report.json"
     agent_trace_path = manifests_dir / "agent_trace.json"
     image_manifest_path = manifests_dir / "image_manifest.json"
     table_manifest_path = manifests_dir / "table_manifest.json"
@@ -522,8 +522,6 @@ async def scrape_product(
         output_dir=out_dir,
         input_context=input_context,
         upstream_evidence=upstream_bundle,
-        url_analysis=url_analysis,
-        proxy_plan=proxy_plan,
         request_json_path=request_path,
         scrape_result_json_path=result_path,
         source_md_path=source_path,
@@ -534,6 +532,7 @@ async def scrape_product(
         metadata_json_path=metadata_path,
         noise_report_json_path=noise_report_path,
         evidence_recovery_report_json_path=evidence_recovery_report_path,
+        quality_report_json_path=quality_report_path,
         agent_trace_json_path=agent_trace_path,
         image_manifest_path=image_manifest_path,
         table_manifest_path=table_manifest_path,
@@ -543,10 +542,6 @@ async def scrape_product(
     _write_json(request_path, {
         "scrape_id": sid,
         "product_url": url,
-        "primary_input": {"product_url": url},
-        "supporting_context_policy": "Optional fields are used for decision trace, validation, locale/proxy routing, and relevance checks; URL remains primary.",
-        "url_analysis": url_analysis.model_dump(),
-        "proxy_plan": proxy_plan,
         "main_text": input_context.main_text,
         "ean": input_context.ean,
         "retailer_name": input_context.retailer_name,
@@ -563,11 +558,8 @@ async def scrape_product(
         "max_agent_iterations": loop_iterations,
         "strict_product_only": strict_product_only,
         "write_raw_debug": raw_debug_enabled,
-        "native_proxy_routing_enabled": enable_proxy_retry,
-        "geo_proxy_enabled_legacy_flag": cfg.geo_proxy_enabled,
+        "geo_proxy_enabled": cfg.geo_proxy_enabled,
         "geo_retry_on_access_block": cfg.geo_retry_on_access_block,
-        "proxy_country_code": proxy_country_code,
-        "proxy_endpoint_configured": bool(proxy_plan_obj.proxy_url),
         "created_at": started.isoformat(),
     })
 
@@ -579,13 +571,6 @@ async def scrape_product(
     logger.info("  url       : {}", url)
     logger.info("  out_dir   : {}", out_dir)
     logger.info("  mode      : product_only={} agentic={} max_iterations={}", strict_product_only, cfg.agentic_enabled, loop_iterations)
-    logger.info("  url plan  : domain={} country_hint={} slug_tokens={} product_ids={}",
-                url_analysis.retailer_domain or "-", url_analysis.url_country_hint or "-",
-                ",".join(url_analysis.slug_tokens[:8]) or "-",
-                ",".join(url_analysis.product_id_candidates[:5]) or "-")
-    logger.info("  proxy     : enabled={} target_country={} source={} endpoint_configured={}",
-                proxy_plan_obj.enabled, proxy_plan_obj.target_country_code or "-",
-                proxy_plan_obj.proxy_source, bool(proxy_plan_obj.proxy_url))
     if input_context.has_any():
         logger.info("  context   : main_text={!r} ean={} retailer={!r} country={}",
                     input_context.main_text[:70], input_context.ean or "-",
@@ -603,10 +588,6 @@ async def scrape_product(
         input_context=input_context,
         product_hint=resolved_hint,
         max_iterations=loop_iterations,
-        url_analysis=url_analysis,
-        proxy_url=proxy_url,
-        proxy_country_code=proxy_country_code,
-        enable_proxy_retry=enable_proxy_retry,
     )
     result.agent_trace = trace
     result.agent_iterations = max(0, len([t for t in trace if t.get("executed_action")]))
@@ -630,7 +611,7 @@ async def scrape_product(
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
                 len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
 
-    _write_json(metadata_path, _metadata_payload(page, input_context, resolved_hint, upstream_bundle, url_analysis, proxy_plan))
+    _write_json(metadata_path, _metadata_payload(page, input_context, resolved_hint, upstream_bundle))
     if raw_debug_enabled:
         result.raw_debug_dir = _write_debug_raw(out_dir, page)
         logger.info("  debug_raw : {}", result.raw_debug_dir)
@@ -662,6 +643,13 @@ async def scrape_product(
             "proxy_used": result.proxy_used,
             "message": "Access failure does not imply the product is absent from the retailer site; no recoverable evidence was supplied or discovered.",
         })
+        empty_quality_report = {
+            "artifact_quality": "insufficient",
+            "requires_manual_review": True,
+            "missing_critical_fields": ["all_product_evidence"],
+            "reason": result.error,
+        }
+        _write_json(quality_report_path, empty_quality_report)
         _write_json(artifact_manifest_path, _artifact_manifest(
             scrape_id=sid,
             input_context=input_context,
@@ -671,8 +659,7 @@ async def scrape_product(
             images=[],
             tables=[],
             evidence=None,
-            url_analysis=url_analysis,
-            proxy_plan=proxy_plan,
+            quality_report=empty_quality_report,
         ))
         _write_json(result_path, result.to_scrape_result().model_dump())
         logger.error("  ✗ no recoverable evidence: {}", result.error)
@@ -724,7 +711,6 @@ async def scrape_product(
         evidence = deterministic_product_evidence(
             page=page, tables=tables, images=refs, input_context=input_context,
             product_hint=resolved_hint, upstream_evidence=upstream_bundle, reason="PCA_LLM_ENABLED=false",
-            url_analysis=url_analysis, proxy_plan=proxy_plan,
         )
     else:
         try:
@@ -737,8 +723,6 @@ async def scrape_product(
                 product_hint=resolved_hint,
                 upstream_evidence=upstream_bundle,
                 scrape_id=sid,
-                url_analysis=url_analysis,
-                proxy_plan=proxy_plan,
             )
         except Exception as exc:
             norm_err = f"{type(exc).__name__}: {exc}"
@@ -746,7 +730,6 @@ async def scrape_product(
             evidence = deterministic_product_evidence(
                 page=page, tables=tables, images=refs, input_context=input_context,
                 product_hint=resolved_hint, upstream_evidence=upstream_bundle, reason=norm_err,
-                url_analysis=url_analysis, proxy_plan=proxy_plan,
             )
             result.error = f"product evidence fallback used: {norm_err}"
 
@@ -760,9 +743,6 @@ async def scrape_product(
     evidence.quality.setdefault("proxy_source", result.proxy_source)
     evidence.quality.setdefault("upstream_evidence_present", upstream_bundle.has_any())
     evidence.quality.setdefault("browser_visible", result.browser_visible)
-    evidence.quality.setdefault("url_analysis", url_analysis.model_dump())
-    evidence.quality.setdefault("proxy_plan", proxy_plan)
-    evidence.quality.setdefault("url_first_policy", "product_url is primary; optional context is supporting trace/validation only")
     result.evidence_axes_used = evidence_axes_from_product_evidence(evidence)
     result.product_details_recovered = deterministic_product_details_recovered(evidence)
     recovery_report = build_evidence_recovery_report(
@@ -836,6 +816,27 @@ async def scrape_product(
     result.claims_markdown = md
     logger.info("  ✓ claims.md ({:,} chars) in {:.2f}s", len(md), time.monotonic() - t_step)
 
+    # Step 6B: Deterministic artifact quality gate.
+    quality_report = build_artifact_quality_report(
+        evidence=evidence,
+        result=result,
+        page=page,
+        tables=tables,
+        images=refs,
+        input_context=input_context,
+        upstream_evidence=upstream_bundle,
+    )
+    _write_json(quality_report_path, quality_report)
+    result.product_evidence.setdefault("quality_gate", quality_report)
+    if quality_report.get("requires_manual_review") and not result.error:
+        result.error = "artifact quality gate requires review: " + ", ".join(quality_report.get("missing_critical_fields", [])[:5])
+    logger.info(
+        "  ✓ quality_report.json quality={} review={} missing={}",
+        quality_report.get("artifact_quality"),
+        quality_report.get("requires_manual_review"),
+        quality_report.get("missing_critical_fields", []),
+    )
+
     # Step 7: Manifests.
     logger.info("")
     logger.info("── STEP 7/7: WRITE MANIFESTS ──")
@@ -850,8 +851,7 @@ async def scrape_product(
         images=refs,
         tables=tables,
         evidence=evidence,
-        url_analysis=url_analysis,
-        proxy_plan=proxy_plan,
+        quality_report=quality_report,
     ))
     _write_json(result_path, result.to_scrape_result().model_dump())
     logger.info("  ✓ artifact_manifest.json")

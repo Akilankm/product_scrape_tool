@@ -37,12 +37,11 @@ If install hangs at `jedi`, it is almost always from the notebook dependency cha
 ```text
 INPUT   : product_url
 OPTIONAL: main_text, ean, retailer_name, country_code, product_hint
-OPTIONAL ROUTING: proxy_url, proxy_country_code, enable_proxy_retry
 OPTIONAL RECOVERY EVIDENCE: upstream_ai_evidence, candidate_snippets, search_evidence
 OUTPUT  : noise-free product evidence artifact folder
 ```
 
-The URL is the primary anchor. Optional fields are supporting context for decision trace, validation, image relevance, locale/proxy routing, and evidence normalization. They never trigger search and are not treated as retailer truth unless supported by captured evidence.
+The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
 ## What changed in v1.1.5
 
@@ -60,7 +59,8 @@ The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 5. LLM normalizer creates product-only evidence JSON/Markdown
 6. claims.md is generated only from normalized product evidence
 7. If browser access is blocked/weak, Evidence Recovery Mode can use caller-supplied upstream AI/search evidence without performing search itself
-8. The artifact records `url_analysis`, `supporting_context_assessment`, `proxy_plan`, and planner decisions in the trace
+8. Image CDN recovery retries with browser-like headers/referers and optional Playwright request fallback
+9. Deterministic quality gate writes `quality_report.json` for downstream acceptance/manual-review decisions
 ```
 
 No web search is performed inside this scraper. No external facts are used unless the caller supplies them as upstream evidence, and those claims are explicitly tagged with `A` evidence axis. No guesses are allowed.
@@ -95,7 +95,7 @@ result = await ProductScrapingAgent().scrape(
         main_text="LEGO DUPLO 10965 Bath Time Fun",
         ean="5702017153647",
         retailer_name="Example Retailer",
-        country_code="CZ",          # supporting routing/trace context
+        country_code="CZ",
         output_root=Path("data/scraped"),
         max_agent_iterations=2,
 
@@ -103,10 +103,6 @@ result = await ProductScrapingAgent().scrape(
         # The scraper will not search; it only uses this as A-axis recovery evidence.
         upstream_ai_evidence="SerpAPI AI Mode / indexed evidence text here",
         candidate_snippets=["Retailer indexed snippet here"],
-
-        # Optional proxy controls. Proxy routing is native; endpoint credentials stay external.
-        # proxy_url="http://user:pass@cz-proxy.example:8080",
-        # proxy_country_code="CZ",
     )
 )
 
@@ -126,7 +122,6 @@ pdm run python scripts/run_scrape.py \
   --retailer-name "Example Retailer" \
   --country-code "CZ" \
   --max-agent-iterations 2 \
-  --proxy-country-code "CZ" \
   --upstream-ai-evidence-file evidence/ai_mode.txt \
   --candidate-snippet "Indexed retailer snippet..." \
   --search-evidence-json evidence/search_evidence.json \
@@ -156,6 +151,7 @@ data/scraped/<scrape_id>/
     ├── metadata.json                  # structured page metadata and capture counts
     ├── noise_report.json              # confirms noisy page/site content was excluded
     ├── evidence_recovery_report.json  # browser/proxy/upstream evidence recovery audit
+    ├── quality_report.json            # deterministic artifact completeness gate
     ├── tables/
     │   ├── table_001.md
     │   └── ...
@@ -183,11 +179,12 @@ Use these files first:
 | `claims.md` | Final grounded claim narrative generated from normalized evidence only. |
 | `source.md` | Product-only text blocks retained from retailer evidence. Not raw noisy page text. |
 | `vision.md` | Product-relevant image observations. |
-| `metadata.json` | URL analysis, proxy plan, canonical URL, title, JSON-LD, OG/product metadata, capture counts. |
+| `metadata.json` | Canonical URL, title, JSON-LD, OG/product metadata, capture counts. |
 | `evidence_recovery_report.json` | Explains whether the browser saw the page, whether product details were recovered, and which evidence sources were used. |
+| `quality_report.json` | Deterministic quality gate: strong/usable/partial/insufficient, missing fields, warnings, and follow-up recommendations. |
 | `tables/` | HTML tables converted to Markdown for spec evidence. |
 | `images/` | Downloaded product images retained by relevance filtering. |
-| `manifests/agent_trace.json` | URL-first analysis, supporting-context assessment, LLM planner decisions, and same-page iterative scrape actions. |
+| `manifests/agent_trace.json` | LLM planner decisions and same-page iterative scrape actions. |
 
 ## Evidence axes
 
@@ -216,11 +213,11 @@ PCA_STRICT_PRODUCT_ONLY=true
 PCA_WRITE_RAW_DEBUG=false
 PCA_LLM_ENABLED=true
 PCA_LLM_VISION_ENABLED=true
+PCA_RELEVANCE_BATCH_ENABLED=true
+PCA_IMAGE_RETRY_STRATEGIES_ENABLED=true
+PCA_IMAGE_BROWSER_REQUEST_FALLBACK=true
 PCA_SCAN_FULL_PAGE=false
 PCA_EVIDENCE_RECOVERY_MODE=true
-PCA_GEO_RETRY_ON_ACCESS_BLOCK=true
-PCA_PROXY_URL_CZ=
-PCA_ACCEPT_LANGUAGE_CZ=
 ```
 
 ## Package structure
@@ -230,8 +227,6 @@ src/product_scraping_agent/
 ├── agent.py          # Public ProductScrapingAgent API
 ├── pipeline.py       # Agentic URL → product-only artifact orchestration
 ├── agentic.py        # LLM planning + product-only normalization
-├── url_analysis.py   # URL decomposition and supporting-context assessment
-├── proxy_router.py   # Native same-URL proxy/locale routing plan
 ├── full_scraper.py   # Crawl4AI rendering + follow-up profiles + HTML extraction
 ├── images.py         # Image download, dedupe, relevance, vision notes
 ├── models.py         # ScrapeRequest, ScrapeResult, ProductEvidence, ImageRef, TableRef
@@ -275,23 +270,16 @@ proxy_source
 access_attempts
 ```
 
-Proxy retry orchestration is built in. If you have an authorised target-country proxy/VPN egress, configure only the endpoint/credentials in `.env`, YAML, request override, or a secret-injected environment variable:
+If you have an authorised target-country proxy/VPN egress, configure it in `.env`:
 
 ```env
+PCA_GEO_PROXY_ENABLED=true
 PCA_GEO_RETRY_ON_ACCESS_BLOCK=true
 PCA_PROXY_URL_CZ=http://user:pass@cz-proxy.example:8080
 PCA_ACCEPT_LANGUAGE_CZ=cs-CZ,cs;q=0.9,en;q=0.7
 ```
 
-The agent resolves the proxy target from this priority order:
-
-```text
-1. request.proxy_country_code
-2. request.country_code
-3. URL country hint from the domain
-```
-
-Without a configured proxy endpoint, a geo/access-blocked page produces an artifact with `access_status` such as `geo_restricted`, `access_denied`, or `bot_challenge`. It will **not** claim that the product is missing. If upstream AI/search evidence is supplied by the caller, the agent can still build a recovered product evidence artifact and tag those claims as `A` axis.
+Without a configured proxy, a geo/access-blocked page produces an artifact with `access_status` such as `geo_restricted`, `access_denied`, or `bot_challenge`. It will **not** claim that the product is missing. If upstream AI/search evidence is supplied by the caller, the agent can still build a recovered product evidence artifact and tag those claims as `A` axis.
 
 ## Evidence Recovery Mode
 
