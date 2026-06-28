@@ -372,6 +372,14 @@ product_evidence.md    # identity/claims/spec/visual/gap tables
 claims.md              # business-level decision dossier
 ```
 
+
+## v1.2.1 note — notebook + image count semantics
+
+- The notebook is updated for fallback-source runs and includes weak-capture diagnostics.
+- `image_candidate_count` means discovered image URLs/candidates.
+- `image_count` and `final_image_count` mean final clean images retained under `retailer/images/` after vision confirmation.
+- For weak Amazon-style captures, it is valid and expected for `image_candidate_count > 0` while `final_image_count == 0`. In that case, candidates are retained only in `manifests/image_manifest.json`, not as handoff images.
+
 ## v1.2.0 note — input/URL recovery for fallback links
 
 The scraper now treats `product_url + main_text + ean + requested/source context` as sufficient to create the artifact. If the browser receives only a weak HTTP-200 shell page, the run is not stopped and the user is not forced to provide upstream evidence. The artifact is still created from:

@@ -418,7 +418,14 @@ class ScrapeResult(BaseModel):
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
+    # Image counters are intentionally separated:
+    # - image_candidate_count = URLs/candidates discovered during extraction
+    # - image_count / final_image_count = final clean files retained under retailer/images/
+    #   after vision confirmation. This avoids interpreting weak/blocked pages as
+    #   having real product images when only candidates were seen.
+    image_candidate_count: int = 0
     image_count: int = 0
+    final_image_count: int = 0
     image_downloaded_count: int = 0
     vision_described_count: int = 0
     table_count: int = 0
@@ -633,9 +640,11 @@ class ScrapedProduct(BaseModel):
             source_alignment_report_json_path=self.source_alignment_report_json_path,
             agent_trace_json_path=self.agent_trace_json_path,
             raw_debug_dir=self.raw_debug_dir,
-            image_count=len(self.images),
+            image_candidate_count=len(self.images),
+            image_count=sum(1 for img in self.images if img.local_path and img.description and str(img.relevance).lower() == "yes"),
+            final_image_count=sum(1 for img in self.images if img.local_path and img.description and str(img.relevance).lower() == "yes"),
             image_downloaded_count=sum(1 for img in self.images if img.local_path),
-            vision_described_count=sum(1 for img in self.images if img.description),
+            vision_described_count=sum(1 for img in self.images if img.local_path and img.description),
             table_count=len(self.tables),
             json_ld_count=len(self.json_ld),
             agent_iterations=self.agent_iterations,

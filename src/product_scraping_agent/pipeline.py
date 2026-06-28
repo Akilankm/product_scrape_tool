@@ -227,7 +227,7 @@ def _artifact_manifest(
 ) -> dict[str, Any]:
     quality = evidence.quality if evidence else {}
     return {
-        "artifact_version": "product_scrape.v8.input_url_recovery",
+        "artifact_version": "product_scrape.v9.result_image_semantics",
         "scrape_id": scrape_id,
         "input_context": input_context.model_dump(),
         "source_alignment": source_alignment.model_report(),
@@ -269,8 +269,9 @@ def _artifact_manifest(
         },
         "counts": {
             "image_candidates": len(images),
+            "final_images": sum(1 for i in images if i.local_path and i.description and str(i.relevance).lower() == "yes"),
             "images_downloaded": sum(1 for i in images if i.local_path),
-            "images_described": sum(1 for i in images if i.description),
+            "images_described": sum(1 for i in images if i.local_path and i.description),
             "image_download_errors": sum(1 for i in images if i.error),
             "image_cdn_403_errors": sum(1 for i in images if "403" in (i.error or "")),
             "tables": len(tables),
@@ -289,7 +290,7 @@ def _artifact_manifest(
             "has_url_derived_evidence": bool(result.url),
             "has_text_evidence": bool(result.raw_markdown),
             "has_structured_data": bool(result.json_ld),
-            "has_visual_evidence": any(i.description for i in images),
+            "has_visual_evidence": any(i.local_path and i.description and str(i.relevance).lower() == "yes" for i in images),
             "has_table_evidence": bool(tables),
             "has_product_evidence_json": bool(evidence),
             "has_claims_synthesis": bool(result.claims_markdown),
