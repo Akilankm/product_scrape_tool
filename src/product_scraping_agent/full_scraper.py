@@ -42,7 +42,7 @@ _ACCESS_BLOCK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("geo_restricted", re.compile(r"\b(not available|unavailable|blocked|restricted)\b.{0,80}\b(country|region|location|territory|area|geo)", re.I)),
     ("geo_restricted", re.compile(r"\b(country|region|location|territory|area|geo)\b.{0,80}\b(not supported|not allowed|not available|blocked|restricted)", re.I)),
     ("access_denied", re.compile(r"\b(access denied|forbidden|request blocked|you don't have permission|permission denied)\b", re.I)),
-    ("bot_challenge", re.compile(r"\b(captcha|cloudflare|verify you are human|checking your browser|robot check|bot protection)\b", re.I)),
+    ("bot_challenge", re.compile(r"\b(captcha|cloudflare|verify you are human|checking your browser|robot check|bot protection|automated access|not a robot|validatecaptcha|enter the characters you see below|enable javascript and cookies)\b", re.I)),
     ("rate_limited", re.compile(r"\b(too many requests|rate limit|temporarily blocked)\b", re.I)),
 )
 

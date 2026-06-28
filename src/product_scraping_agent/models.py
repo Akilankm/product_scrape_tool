@@ -424,8 +424,26 @@ class ScrapeResult(BaseModel):
     table_count: int = 0
     json_ld_count: int = 0
     agent_iterations: int = 0
+
+    # Deterministic quality gate summary copied from retailer/quality_report.json.
+    artifact_quality: str = "not_evaluated"
+    quality_score: int = 0
+    requires_manual_review: bool = False
+    missing_critical_fields: list[str] = Field(default_factory=list)
+    quality_warnings: list[str] = Field(default_factory=list)
+
     elapsed_seconds: float = 0.0
     error: str = ""
+
+    @property
+    def quality_report_path(self) -> Path | None:
+        """Backward-compatible notebook alias for quality_report_json_path."""
+        return self.quality_report_json_path
+
+    @property
+    def source_alignment_report_path(self) -> Path | None:
+        """Backward-compatible notebook alias for source_alignment_report_json_path."""
+        return self.source_alignment_report_json_path
 
 
 class PlannedScrapeAction(BaseModel):
@@ -463,10 +481,49 @@ class ProductEvidence(BaseModel):
     structured_claims: list[dict[str, Any]] = Field(default_factory=list)
     table_claims: list[dict[str, Any]] = Field(default_factory=list)
     visual_claims: list[dict[str, Any]] = Field(default_factory=list)
-    discrepancies: list[dict[str, Any]] = Field(default_factory=list)
-    gaps: list[str] = Field(default_factory=list)
+    discrepancies: list[Any] = Field(default_factory=list)
+    gaps: list[Any] = Field(default_factory=list)
     noise_exclusion_summary: dict[str, Any] = Field(default_factory=dict)
     quality: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator(
+        "retailer_claims",
+        "source_specific_claims",
+        "product_only_text_blocks",
+        "structured_claims",
+        "table_claims",
+        "visual_claims",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_list_of_dicts(cls, value: Any) -> list[dict[str, Any]]:
+        """LLMs sometimes return a scalar/string where a list of objects is expected.
+
+        Keep the artifact generation robust by preserving the payload as a
+        generic claim object rather than failing validation and falling back.
+        """
+        if value in (None, ""):
+            return []
+        if isinstance(value, dict):
+            return [value]
+        if not isinstance(value, list):
+            return [{"value": value}]
+        out: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                out.append(item)
+            else:
+                out.append({"value": item})
+        return out
+
+    @field_validator("gaps", "discrepancies", mode="before")
+    @classmethod
+    def _coerce_freeform_list(cls, value: Any) -> list[Any]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
 
 
 class ScrapedProduct(BaseModel):
@@ -531,6 +588,7 @@ class ScrapedProduct(BaseModel):
     elapsed_seconds: float = 0.0
 
     def to_scrape_result(self) -> ScrapeResult:
+        quality_gate = (self.product_evidence or {}).get("quality_gate") or {}
         return ScrapeResult(
             success=self.success,
             scrape_id=self.scrape_id,
@@ -575,6 +633,11 @@ class ScrapedProduct(BaseModel):
             table_count=len(self.tables),
             json_ld_count=len(self.json_ld),
             agent_iterations=self.agent_iterations,
+            artifact_quality=str(quality_gate.get("artifact_quality") or "not_evaluated"),
+            quality_score=int(quality_gate.get("quality_score") or 0),
+            requires_manual_review=bool(quality_gate.get("requires_manual_review") or False),
+            missing_critical_fields=list(quality_gate.get("missing_critical_fields") or []),
+            quality_warnings=list(quality_gate.get("warnings") or []),
             elapsed_seconds=self.elapsed_seconds,
             error=self.error,
         )
