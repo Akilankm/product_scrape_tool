@@ -371,3 +371,13 @@ vision.md              # retained image decision table + observations
 product_evidence.md    # identity/claims/spec/visual/gap tables
 claims.md              # business-level decision dossier
 ```
+
+## v1.2.0 note — input/URL recovery for fallback links
+
+The scraper now treats `product_url + main_text + ean + requested/source context` as sufficient to create the artifact. If the browser receives only a weak HTTP-200 shell page, the run is not stopped and the user is not forced to provide upstream evidence. The artifact is still created from:
+
+- `I` = caller-provided input context (`main_text`, `ean`, requested retailer/country)
+- `U` = URL-derived provenance/identity hints from the supplied `product_url`
+- `T/S/D/V/A` = browser text, metadata, tables, vision/images, and optional upstream evidence when available
+
+Weak capture is recorded in `metadata.json`, `evidence_recovery_report.json`, `quality_report.json`, and `artifact_manifest.json`. `result.error` is reserved for technical failures; quality/manual-review decisions are exposed through `result.artifact_quality`, `result.requires_manual_review`, and `quality_report.json`.

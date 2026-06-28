@@ -24,6 +24,7 @@ from .agentic import (
     build_artifact_quality_report,
     build_evidence_recovery_report,
     build_noise_report,
+    page_capture_health,
     deterministic_product_evidence,
     evidence_axes_from_product_evidence,
     deterministic_product_details_recovered,
@@ -155,6 +156,7 @@ def _metadata_payload(
         "proxy_used": page.proxy_used,
         "proxy_source": page.proxy_source,
         "access_attempts": page.access_attempts,
+        "capture_health": page_capture_health(page),
         "title": page.title,
         "description": page.description,
         "canonical_url": page.canonical_url,
@@ -225,7 +227,7 @@ def _artifact_manifest(
 ) -> dict[str, Any]:
     quality = evidence.quality if evidence else {}
     return {
-        "artifact_version": "product_scrape.v7.source_alignment",
+        "artifact_version": "product_scrape.v8.input_url_recovery",
         "scrape_id": scrape_id,
         "input_context": input_context.model_dump(),
         "source_alignment": source_alignment.model_report(),
@@ -241,6 +243,7 @@ def _artifact_manifest(
         "proxy_source": result.proxy_source,
         "raw_debug_written": bool(result.raw_debug_dir),
         "browser_visible": result.browser_visible,
+        "capture_health": page_capture_health(FullPage(url=result.url, final_url=result.final_url, success=result.browser_visible, access_status=result.access_status, raw_markdown=result.raw_markdown, raw_html=result.raw_html, title=result.title, json_ld=result.json_ld)),
         "product_details_recovered": result.product_details_recovered,
         "recovery_status": result.recovery_status,
         "evidence_axes_used": result.evidence_axes_used,
@@ -274,6 +277,8 @@ def _artifact_manifest(
             "json_ld_blocks": len(result.json_ld),
             "agent_iterations": result.agent_iterations,
             "retailer_claims": len(evidence.retailer_claims) if evidence else 0,
+            "url_derived_claims": len(evidence.url_derived_claims) if evidence else 0,
+            "input_context_claims": len(evidence.input_context_claims) if evidence else 0,
             "product_only_text_blocks": len(evidence.product_only_text_blocks) if evidence else 0,
         },
         "quality": {
@@ -281,6 +286,7 @@ def _artifact_manifest(
             "browser_page_captured": result.browser_visible,
             "product_details_recovered": result.product_details_recovered,
             "input_context_provided": input_context.has_any(),
+            "has_url_derived_evidence": bool(result.url),
             "has_text_evidence": bool(result.raw_markdown),
             "has_structured_data": bool(result.json_ld),
             "has_visual_evidence": any(i.description for i in images),
@@ -360,8 +366,11 @@ def _deterministic_followup_action(page: FullPage, used_actions: dict[str, int])
     def available(action: str) -> bool:
         return action in _ALLOWED_ACTIONS and used_actions.get(action, 0) < _MAX_REPEAT_ACTIONS
 
+    health = page_capture_health(page)
     if page.access_status != "accessible" and available("retry_relaxed"):
         return "retry_relaxed", "direct capture has access/visibility weakness; retry relaxed same-URL profile"
+    if health.get("weak_capture") and available("retry_relaxed"):
+        return "retry_relaxed", "HTTP/page capture is weak or looks like a shell/block page; retry relaxed same-URL profile"
     if md_chars < 5_000 and html_chars > md_chars * 3 and available("expand_common_sections"):
         return "expand_common_sections", "rendered markdown is thin compared with HTML; expand common product sections"
     if md_chars < 8_000 and table_count == 0 and jsonld_count == 0 and available("full_page_scroll"):
@@ -398,13 +407,13 @@ async def _agentic_fetch_loop(
         "status": page.status,
     })
 
-    if not (cfg.agentic_enabled and cfg.llm_enabled) or max_iterations <= 0 or not page.success:
+    if not (cfg.agentic_enabled and cfg.llm_enabled) or max_iterations <= 0:
         return page, trace
 
     used_actions: dict[str, int] = {}
     for iteration in range(1, max_iterations + 1):
         try:
-            plan = await asyncio.to_thread(plan_next_actions, page, input_context, product_hint)
+            plan = await asyncio.to_thread(plan_next_actions, page, input_context, source_alignment, product_hint)
         except Exception as exc:
             logger.warning("agent planner failed at iteration {}: {}", iteration, exc)
             trace.append({"iteration": iteration, "planner_error": f"{type(exc).__name__}: {exc}", "stopped": True})
@@ -706,7 +715,7 @@ async def scrape_product(
     result.proxy_used = page.proxy_used
     result.proxy_source = page.proxy_source
     result.access_attempts = list(page.access_attempts or [])
-    result.browser_visible = bool(page.success and (page.raw_markdown or page.raw_html) and page.access_status == "accessible")
+    result.browser_visible = bool(page_capture_health(page).get("browser_product_visible"))
     source_alignment_report = _build_source_alignment_report(
         source_alignment=source_alignment,
         final_url=result.final_url,
@@ -719,6 +728,9 @@ async def scrape_product(
     logger.info("  profiles  : {}", ", ".join(page.profiles_merged or [page.fetch_profile]))
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
                 len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
+    capture_health = page_capture_health(page)
+    if capture_health.get("weak_capture"):
+        logger.warning("  capture   : weak_capture reasons={} — artifact will still be created from URL/input evidence", capture_health.get("weak_reasons"))
 
     _write_json(metadata_path, _metadata_payload(page, input_context, source_alignment, resolved_hint, upstream_bundle))
     if raw_debug_enabled:
@@ -945,8 +957,7 @@ async def scrape_product(
     )
     _write_json(quality_report_path, quality_report)
     result.product_evidence.setdefault("quality_gate", quality_report)
-    if quality_report.get("requires_manual_review") and not result.error:
-        result.error = "artifact quality gate requires review: " + ", ".join(quality_report.get("missing_critical_fields", [])[:5])
+    # Quality/manual-review is recorded in quality_report.json and ScrapeResult fields; it is not a technical scrape error.
     logger.info(
         "  ✓ quality_report.json quality={} review={} missing={}",
         quality_report.get("artifact_quality"),

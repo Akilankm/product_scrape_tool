@@ -6,6 +6,7 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from .full_scraper import FullPage
 from .log import logger
@@ -41,7 +42,7 @@ def _json_loads_object(text: str) -> dict[str, Any]:
     return obj
 
 
-def page_observation_summary(page: FullPage, input_context: ProductInputContext, product_hint: str) -> str:
+def page_observation_summary(page: FullPage, input_context: ProductInputContext, source_alignment: SourceAlignmentContext, product_hint: str) -> str:
     """Compact planner context — enough for gap detection, not full final evidence."""
     head = {
         "requested_url": page.url,
@@ -68,6 +69,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
             "json_ld_blocks": len(page.json_ld),
         },
         "input_context": input_context.model_dump(),
+        "capture_health": page_capture_health(page),
         "source_alignment": source_alignment.model_report(),
         "product_hint": product_hint,
         "structured_keys": {
@@ -87,7 +89,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
     )
 
 
-def plan_next_actions(page: FullPage, input_context: ProductInputContext, product_hint: str) -> AgentPlan:
+def plan_next_actions(page: FullPage, input_context: ProductInputContext, source_alignment: SourceAlignmentContext, product_hint: str) -> AgentPlan:
     """Ask the LLM whether more same-page scraping is required."""
     from .services.llm import get_llm_service
 
@@ -109,7 +111,7 @@ def plan_next_actions(page: FullPage, input_context: ProductInputContext, produc
         "extract_gallery_sources, retry_relaxed. Do not request web search.\n\n"
         "Return JSON with this shape:\n"
         f"```json\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n```\n\n"
-        f"{page_observation_summary(page, input_context, product_hint)}"
+        f"{page_observation_summary(page, input_context, source_alignment, product_hint)}"
     )
     resp = get_llm_service().predict(
         user,
@@ -126,6 +128,104 @@ def plan_next_actions(page: FullPage, input_context: ProductInputContext, produc
         logger.warning("planner JSON did not validate; using safe stop. error={}", exc)
         return AgentPlan(enough_evidence=True, actions=[], stop_reason="planner output invalid; stop safely")
 
+
+
+def derive_url_evidence(page: FullPage | None, product_url: str = "") -> dict[str, Any]:
+    """Axis U: product evidence derivable from the provided URL itself.
+
+    This is not external search. It preserves the provided fallback/primary URL as
+    evidence so the artifact can still be created when browser rendering returns
+    a weak shell page. URL-derived values are provenance/identity hints, not
+    retailer-rendered page claims.
+    """
+    url = product_url or (page.url if page else "") or (page.final_url if page else "")
+    final_url = (page.final_url if page else "") or url
+    parsed = urlparse(final_url or url)
+    path = unquote(parsed.path or "")
+    segments = [s for s in re.split(r"[/_\-]+", path.strip("/")) if s]
+    sku_like: list[str] = []
+    for seg in re.split(r"[/&?=#._\-]+", final_url):
+        token = seg.strip()
+        if not token:
+            continue
+        # Generic identifier heuristic: ASIN-like, long numeric, or alpha-num SKU.
+        if re.fullmatch(r"[A-Z0-9]{8,14}", token, flags=re.I) or re.fullmatch(r"\d{8,14}", token):
+            if token not in sku_like:
+                sku_like.append(token)
+    title_tokens = [s for s in segments if not re.fullmatch(r"[A-Z0-9]{8,14}|\d{8,14}", s, flags=re.I)]
+    title_hint = " ".join(title_tokens[:14]).strip()
+    return {
+        "present": bool(final_url or url),
+        "axis": "U",
+        "source_url": final_url or url,
+        "domain": parsed.netloc,
+        "path": path,
+        "path_segments": segments[:30],
+        "url_title_hint": title_hint,
+        "url_identifiers": sku_like[:12],
+        "policy": (
+            "U-axis facts come from the supplied URL string only. Use them as provenance/identity hints; "
+            "do not present them as browser-rendered retailer page text unless supported by T/S/D/V."
+        ),
+    }
+
+
+def page_capture_health(page: FullPage) -> dict[str, Any]:
+    """Classify whether the browser actually captured a product page, not just HTTP 200.
+
+    A small HTTP-200 shell such as a marketplace/captcha/language page must be
+    treated as weak capture. This preserves the distinction: fallback URL was
+    attempted, artifact should still be created, but browser evidence is weak.
+    """
+    md = page.raw_markdown or ""
+    html = page.raw_html or ""
+    title = (page.title or "").strip()
+    text = "\n".join([title, md, html[:20_000]]).lower()
+    md_chars = len(md)
+    html_chars = len(html)
+    product_terms = [
+        "product", "brand", "manufacturer", "ean", "gtin", "sku", "mpn", "asin",
+        "price", "availability", "description", "details", "features", "specification",
+        "item model", "model number", "age", "material", "dimensions",
+    ]
+    block_terms = [
+        "captcha", "robot check", "not a robot", "automated access", "enable javascript and cookies",
+        "enter the characters", "validatecaptcha", "sorry", "access denied", "request blocked",
+    ]
+    product_signal_count = sum(1 for term in product_terms if term in text)
+    block_signal_count = sum(1 for term in block_terms if term in text)
+    generic_title = title.lower() in {"amazon.com", "amazon", "access denied", "robot check", "captcha"} or not title
+    structured_count = len(page.json_ld or []) + len(page.tables_html or []) + len(page.og or {}) + len(page.product_meta or {})
+    image_count = len(page.images or [])
+
+    weak_reasons: list[str] = []
+    if page.access_status != "accessible":
+        weak_reasons.append(f"access_status={page.access_status}")
+    if block_signal_count:
+        weak_reasons.append("soft_block_terms_detected")
+    if md_chars < 1200 and html_chars < 8000 and structured_count == 0:
+        weak_reasons.append("very_low_text_and_no_structured_evidence")
+    if generic_title and md_chars < 2500:
+        weak_reasons.append("generic_or_missing_title_with_low_text")
+    if product_signal_count < 2 and md_chars < 2500 and structured_count == 0:
+        weak_reasons.append("few_product_signals")
+
+    browser_product_visible = bool(page.success and page.access_status == "accessible" and not weak_reasons)
+    status = "product_visible" if browser_product_visible else ("weak_capture" if page.success or html or md else "not_captured")
+    return {
+        "browser_product_visible": browser_product_visible,
+        "capture_status": status,
+        "weak_capture": not browser_product_visible,
+        "weak_reasons": weak_reasons,
+        "markdown_chars": md_chars,
+        "html_chars": html_chars,
+        "title": title,
+        "generic_title": generic_title,
+        "product_signal_count": product_signal_count,
+        "block_signal_count": block_signal_count,
+        "structured_signal_count": structured_count,
+        "image_candidate_count": image_count,
+    }
 
 def _structured_axis(page: FullPage) -> dict[str, Any]:
     return {
@@ -145,6 +245,7 @@ def _structured_axis(page: FullPage) -> dict[str, Any]:
         "proxy_used": page.proxy_used,
         "proxy_source": page.proxy_source,
         "access_attempts": page.access_attempts,
+        "capture_health": page_capture_health(page),
     }
 
 
@@ -252,7 +353,7 @@ def normalize_product_evidence(
     from .services.llm import get_llm_service
 
     expected_schema = {
-        "product_focus_summary": "1-3 sentence product/source summary, no guesses",
+        "product_focus_summary": "1-3 sentence product/source summary, no guesses; include if browser capture is weak",
         "source_alignment": {
             "alignment_status": "primary_requested_source|fallback_source_used|source_context_mismatch|not_declared",
             "requested_context": {},
@@ -263,9 +364,9 @@ def normalize_product_evidence(
             "business_interpretation": "how to interpret this source for product coding"
         },
         "product_identity": {
-            "product_name": {"value": "", "evidence_axis": ["B", "T", "P", "A", "S"], "source_refs": [], "confidence": "high|medium|low|missing"},
+            "product_name": {"value": "", "evidence_axis": ["B", "T", "P", "A", "S", "I", "U"], "source_refs": [], "confidence": "high|medium|low|missing"},
             "brand": {"value": "", "evidence_axis": ["B", "T", "P", "A", "V", "S", "D"], "source_refs": [], "confidence": "high|medium|low|missing"},
-            "ean_gtin": {"value": "", "evidence_axis": ["S", "D", "T", "A", "I"], "source_refs": [], "confidence": "high|medium|low|missing"},
+            "ean_gtin": {"value": "", "evidence_axis": ["S", "D", "T", "A", "I", "U"], "source_refs": [], "confidence": "high|medium|low|missing"},
             "sku_mpn": {"value": "", "evidence_axis": [], "source_refs": [], "confidence": "high|medium|low|missing"},
             "manufacturer": {"value": "", "evidence_axis": [], "source_refs": [], "confidence": "high|medium|low|missing"},
             "retailer": {"value": "", "evidence_axis": ["I", "S"], "source_refs": [], "confidence": "high|medium|low|missing"},
@@ -305,6 +406,8 @@ def normalize_product_evidence(
         "table_claims": [],
         "visual_claims": [],
         "upstream_indexed_claims": [],
+        "url_derived_claims": [],
+        "input_context_claims": [],
         "discrepancies": [],
         "gaps": [],
         "noise_exclusion_summary": {
@@ -333,7 +436,9 @@ def normalize_product_evidence(
     payload = {
         "scrape_id": scrape_id,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "axis_I_input_context": {"present": input_context.has_any(), "axis": "I", "value": input_context.model_dump(), "policy": "Caller-supplied product identity context; valid provenance but not browser-rendered retailer page text."},
         "input_context": input_context.model_dump(),
+        "axis_U_url_derived_evidence": derive_url_evidence(page, page.final_url or page.url),
         "product_hint": product_hint,
         "axis_S_structured": _structured_axis(page),
         "axis_D_tables": _tables_axis(tables),
@@ -376,40 +481,119 @@ def deterministic_product_evidence(
     upstream_evidence: UpstreamEvidenceBundle | None = None,
     reason: str = "",
 ) -> ProductEvidence:
-    """Safe fallback when the LLM is unavailable; does not pretend to be complete."""
+    """Safe fallback when the LLM is unavailable or the browser capture is weak.
+
+    This still creates the artifact from the supplied URL + user/business inputs.
+    It does not claim those facts were scraped from rendered page text unless T/S/D/V
+    evidence supports them.
+    """
     source_alignment = source_alignment or SourceAlignmentContext(
         requested_retailer_name=input_context.retailer_name,
         requested_country_code=input_context.country_code,
         source_url_role="unknown",
     )
     upstream_evidence = upstream_evidence or UpstreamEvidenceBundle()
+    url_axis = derive_url_evidence(page, page.final_url or page.url)
+    capture = page_capture_health(page)
+
+    blocks: list[dict[str, Any]] = []
+    if input_context.has_any():
+        blocks.append({
+            "heading": "Caller-supplied product identity context",
+            "content": input_context.compact_hint(),
+            "evidence_axis": ["I"],
+            "claim_scope": "input_context_provenance",
+        })
+    if url_axis.get("url_title_hint") or url_axis.get("url_identifiers"):
+        blocks.append({
+            "heading": "URL-derived product/source hints",
+            "content": json.dumps({
+                "url_title_hint": url_axis.get("url_title_hint"),
+                "url_identifiers": url_axis.get("url_identifiers"),
+                "source_url": url_axis.get("source_url"),
+                "domain": url_axis.get("domain"),
+            }, ensure_ascii=False),
+            "evidence_axis": ["U"],
+            "claim_scope": "url_provenance_not_browser_text",
+        })
+    if upstream_evidence and (upstream_evidence.ai_mode_evidence or "").strip():
+        blocks.append({
+            "heading": "Upstream evidence text — deterministic recovery",
+            "content": truncate_text(upstream_evidence.ai_mode_evidence or "", 12_000),
+            "evidence_axis": ["A"],
+        })
+
     return ProductEvidence(
         product_focus_summary=(
-            "LLM product-only normalization was unavailable. This fallback preserves only high-level captured "
-            "signals and should not be treated as a complete normalized artifact."
+            "Artifact created from the supplied product URL and provided product identity context. "
+            "Browser/page capture may be weak; every retained fact is tagged by evidence axis."
         ),
         source_alignment=source_alignment.model_report(),
         product_identity={
-            "page_title": {"value": page.title, "evidence_axis": ["S", "T"], "source_refs": ["metadata:title"], "confidence": "medium" if page.title else "missing"},
-            "canonical_url": {"value": page.canonical_url, "evidence_axis": ["S"], "source_refs": ["metadata:canonical"], "confidence": "medium" if page.canonical_url else "missing"},
-            "input_context": input_context.model_dump(),
+            "product_name": {
+                "value": input_context.main_text or url_axis.get("url_title_hint", ""),
+                "evidence_axis": ["I"] if input_context.main_text else (["U"] if url_axis.get("url_title_hint") else []),
+                "source_refs": ["input:main_text"] if input_context.main_text else (["url:path"] if url_axis.get("url_title_hint") else []),
+                "confidence": "high" if input_context.main_text else ("low" if url_axis.get("url_title_hint") else "missing"),
+            },
+            "ean_gtin": {
+                "value": input_context.ean,
+                "evidence_axis": ["I"] if input_context.ean else [],
+                "source_refs": ["input:ean"] if input_context.ean else [],
+                "confidence": "high" if input_context.ean else "missing",
+            },
+            "source_url": {
+                "value": url_axis.get("source_url", page.final_url or page.url),
+                "evidence_axis": ["U"],
+                "source_refs": ["input:product_url"],
+                "confidence": "high",
+            },
+            "source_url_identifiers": {
+                "value": url_axis.get("url_identifiers", []),
+                "evidence_axis": ["U"] if url_axis.get("url_identifiers") else [],
+                "source_refs": ["url:path_or_query"] if url_axis.get("url_identifiers") else [],
+                "confidence": "medium" if url_axis.get("url_identifiers") else "missing",
+            },
+            "page_title": {
+                "value": page.title,
+                "evidence_axis": ["S", "T"] if page.title else [],
+                "source_refs": ["metadata:title"] if page.title else [],
+                "confidence": "medium" if page.title and not capture.get("weak_capture") else ("low" if page.title else "missing"),
+            },
+            "canonical_url": {
+                "value": page.canonical_url,
+                "evidence_axis": ["S"] if page.canonical_url else [],
+                "source_refs": ["metadata:canonical"] if page.canonical_url else [],
+                "confidence": "medium" if page.canonical_url else "missing",
+            },
+            "requested_retailer": {
+                "value": input_context.retailer_name,
+                "evidence_axis": ["I"] if input_context.retailer_name else [],
+                "source_refs": ["input:requested_retailer_name"] if input_context.retailer_name else [],
+                "confidence": "high" if input_context.retailer_name else "missing",
+            },
+            "requested_country": {
+                "value": input_context.country_code,
+                "evidence_axis": ["I"] if input_context.country_code else [],
+                "source_refs": ["input:requested_country_code"] if input_context.country_code else [],
+                "confidence": "high" if input_context.country_code else "missing",
+            },
         },
         retailer_claims=[],
         source_specific_claims=[],
-        product_only_text_blocks=(
-            [{
-                "heading": "Upstream evidence text — deterministic recovery",
-                "content": truncate_text((upstream_evidence.ai_mode_evidence or "") if upstream_evidence else "", 12_000),
-                "evidence_axis": ["A"],
-            }]
-            if upstream_evidence and (upstream_evidence.ai_mode_evidence or "").strip()
-            else []
-        ),
-        structured_claims=[{"source": "metadata/json_ld", "value": _structured_axis(page)}],
-        upstream_indexed_claims=[{"source": "upstream_evidence", "value": _upstream_axis(upstream_evidence or UpstreamEvidenceBundle())}] if (upstream_evidence and upstream_evidence.has_any()) else [],
-        table_claims=[{"table_index": t.index, "caption": t.caption, "markdown": t.markdown} for t in tables[:10]],
+        product_only_text_blocks=blocks,
+        structured_claims=[{"source": "metadata/json_ld", "value": _structured_axis(page), "evidence_axis": ["S"]}],
+        upstream_indexed_claims=[{"source": "upstream_evidence", "value": _upstream_axis(upstream_evidence or UpstreamEvidenceBundle()), "evidence_axis": ["A"]}] if (upstream_evidence and upstream_evidence.has_any()) else [],
+        url_derived_claims=[{"source": "product_url", "value": url_axis, "evidence_axis": ["U"], "claim_scope": "url_provenance_not_browser_text"}],
+        input_context_claims=[{"source": "scrape_request", "value": input_context.model_dump(), "evidence_axis": ["I"], "claim_scope": "input_context_provenance"}] if input_context.has_any() else [],
+        table_claims=[{"table_index": t.index, "caption": t.caption, "markdown": t.markdown, "evidence_axis": ["D"]} for t in tables[:10]],
         visual_claims=[v for v in _visual_axis(images)],
-        gaps=[f"LLM normalization failed or disabled: {reason}"],
+        gaps=[{
+            "gap_id": "G001",
+            "type": "normalization_or_capture_gap",
+            "description": f"LLM normalization failed/disabled or browser capture was weak: {reason}",
+            "capture_health": capture,
+        }],
         noise_exclusion_summary={
             "policy": "strict product-only fallback; raw rendered page text is not emitted because it may contain noise",
             "excluded_categories": ["navigation", "footer", "recommendations", "cookie text", "generic shipping/payment boilerplate", "ads", "unrelated products"],
@@ -418,15 +602,19 @@ def deterministic_product_evidence(
             "access_status": page.access_status,
             "access_issue_type": page.access_issue_type,
             "access_issue_reason": page.access_issue_reason,
+            "capture_status": capture.get("capture_status"),
+            "weak_capture_reasons": capture.get("weak_reasons"),
             "geo_restricted": page.geo_restricted,
             "proxy_used": page.proxy_used,
             "proxy_source": page.proxy_source,
-            "browser_visible": bool(page.success and (page.raw_markdown or page.raw_html) and page.access_status == "accessible"),
+            "browser_visible": bool(capture.get("browser_product_visible")),
+            "has_url_derived_evidence": bool(url_axis.get("present")),
+            "has_input_context_evidence": input_context.has_any(),
             "has_upstream_indexed_evidence": bool(upstream_evidence and upstream_evidence.has_any()),
-            "product_details_recovered": bool(upstream_evidence and upstream_evidence.has_any()) or bool(page.title or page.json_ld or page.raw_markdown),
-            "recovery_status": "upstream_recovery" if (upstream_evidence and upstream_evidence.has_any() and not page.success) else "deterministic_fallback",
-            "product_page_confidence": "low",
-            "evidence_completeness": "low",
+            "product_details_recovered": bool(input_context.has_any() or url_axis.get("present") or (upstream_evidence and upstream_evidence.has_any()) or page.json_ld or page.og or page.product_meta),
+            "recovery_status": "browser_primary" if capture.get("browser_product_visible") else "input_url_context_recovery",
+            "product_page_confidence": "low" if capture.get("weak_capture") else "medium",
+            "evidence_completeness": "partial" if (input_context.has_any() or url_axis.get("present")) else "low",
             "fallback_reason": reason,
             "source_alignment_status": source_alignment.alignment_status,
             "requested_retailer_claims_allowed": source_alignment.requested_retailer_claims_allowed,
@@ -434,8 +622,6 @@ def deterministic_product_evidence(
             "created_by": "deterministic_fallback",
         },
     )
-
-
 
 def _cell(value: Any, *, max_len: int = 260) -> str:
     """Markdown table-safe compact cell."""
@@ -553,6 +739,8 @@ def render_product_evidence_md(evidence: ProductEvidence) -> str:
     _append_claim_table(lines, "Structured metadata decision table", data.get("structured_claims", []))
     _append_claim_table(lines, "Table/specification decision table", data.get("table_claims", []))
     _append_claim_table(lines, "Visual evidence decision table", data.get("visual_claims", []))
+    _append_claim_table(lines, "URL-derived evidence table", data.get("url_derived_claims", []))
+    _append_claim_table(lines, "Input-context evidence table", data.get("input_context_claims", []))
     _append_claim_table(lines, "Upstream indexed/search/AI evidence table", data.get("upstream_indexed_claims", []))
 
     lines.extend(["## Product-only text evidence", ""])
@@ -644,7 +832,8 @@ def build_evidence_recovery_report(
     """Explain how product details were recovered when browser access is weak/blocked."""
     axes = evidence_axes_from_product_evidence(evidence) if evidence else []
     recovered = deterministic_product_details_recovered(evidence) if evidence else False
-    browser_visible = bool(page.success and (page.raw_markdown or page.raw_html) and page.access_status == "accessible")
+    capture = page_capture_health(page)
+    browser_visible = bool(capture.get("browser_product_visible"))
     recovery_sources: list[str] = []
     if browser_visible:
         recovery_sources.append("browser_rendered_page")
@@ -660,6 +849,7 @@ def build_evidence_recovery_report(
         recovery_sources.append("json_ld")
     if page.images:
         recovery_sources.append("image_urls_or_gallery")
+    recovery_sources.append("product_url_input")
     if upstream_evidence and upstream_evidence.has_any():
         recovery_sources.append("upstream_indexed_search_ai_evidence")
 
@@ -675,6 +865,7 @@ def build_evidence_recovery_report(
 
     return {
         "browser_visible": browser_visible,
+        "capture_health": capture,
         "access_status": page.access_status,
         "access_issue_type": page.access_issue_type,
         "access_issue_reason": page.access_issue_reason,
@@ -740,6 +931,8 @@ def build_artifact_quality_report(
         + len(evidence.table_claims or [])
         + len(evidence.visual_claims or [])
         + len(getattr(evidence, "upstream_indexed_claims", []) or [])
+        + len(getattr(evidence, "url_derived_claims", []) or [])
+        + len(getattr(evidence, "input_context_claims", []) or [])
     )
     product_text_chars = sum(len(str((b or {}).get("content", ""))) for b in (evidence.product_only_text_blocks or []))
     downloaded_images = [img for img in images if img.local_path]
@@ -766,7 +959,7 @@ def build_artifact_quality_report(
         "has_evidence_axes": bool(axes),
         "has_gap_reporting": isinstance(evidence.gaps, list),
         "noise_exclusion_documented": bool(evidence.noise_exclusion_summary),
-        "browser_access_ok_or_recovered": bool(result.browser_visible or result.product_details_recovered or upstream_evidence.has_any()),
+        "browser_access_ok_or_recovered": bool(result.browser_visible or result.product_details_recovered or upstream_evidence.has_any() or input_context.has_any()),
         "source_alignment_documented": bool(evidence.source_alignment or source_alignment.model_report()),
         "fallback_claim_scope_safe": bool(source_alignment.requested_retailer_claims_allowed or source_alignment.source_specific_claim_scope == "scraped_source_only"),
     }
@@ -796,6 +989,9 @@ def build_artifact_quality_report(
         warnings.append("no table or JSON-LD product data captured")
     if result.access_status != "accessible":
         warnings.append(f"browser access status is {result.access_status}; evidence recovery mode used")
+    capture = page_capture_health(page)
+    if capture.get("weak_capture") and result.access_status == "accessible":
+        warnings.append("HTTP 200 returned but product-page capture is weak; artifact relies on input/URL/context evidence where needed")
     if source_alignment.alignment_status != "primary_requested_source":
         warnings.append(f"source alignment is {source_alignment.alignment_status}; source-specific commercial claims are scoped to {source_alignment.source_specific_claim_scope}")
 
@@ -835,7 +1031,7 @@ def build_artifact_quality_report(
     if download_403:
         recommended_followups.append("enable/verify image CDN retry settings and referer/cookie/proxy configuration")
     if result.access_status != "accessible":
-        recommended_followups.append("configure authorised target-country proxy or pass upstream AI/search evidence")
+        recommended_followups.append("configure authorised target-country proxy if browser-rendered retailer evidence is mandatory")
     if not input_context.main_text and not input_context.ean:
         recommended_followups.append("provide main_text and/or EAN to strengthen identity validation")
 
@@ -853,6 +1049,8 @@ def build_artifact_quality_report(
             "structured_claims": len(evidence.structured_claims or []),
             "table_claims": len(evidence.table_claims or []),
             "visual_claims": len(evidence.visual_claims or []),
+            "url_derived_claims": len(getattr(evidence, "url_derived_claims", []) or []),
+            "input_context_claims": len(getattr(evidence, "input_context_claims", []) or []),
             "product_only_text_blocks": len(evidence.product_only_text_blocks or []),
             "product_only_text_chars": product_text_chars,
             "downloaded_images": len(downloaded_images),

@@ -481,6 +481,9 @@ class ProductEvidence(BaseModel):
     structured_claims: list[dict[str, Any]] = Field(default_factory=list)
     table_claims: list[dict[str, Any]] = Field(default_factory=list)
     visual_claims: list[dict[str, Any]] = Field(default_factory=list)
+    upstream_indexed_claims: list[dict[str, Any]] = Field(default_factory=list)
+    url_derived_claims: list[dict[str, Any]] = Field(default_factory=list)
+    input_context_claims: list[dict[str, Any]] = Field(default_factory=list)
     discrepancies: list[Any] = Field(default_factory=list)
     gaps: list[Any] = Field(default_factory=list)
     noise_exclusion_summary: dict[str, Any] = Field(default_factory=dict)
@@ -493,6 +496,9 @@ class ProductEvidence(BaseModel):
         "structured_claims",
         "table_claims",
         "visual_claims",
+        "upstream_indexed_claims",
+        "url_derived_claims",
+        "input_context_claims",
         mode="before",
     )
     @classmethod

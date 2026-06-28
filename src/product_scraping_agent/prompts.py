@@ -46,9 +46,9 @@ class P:
             "recommendation carousels, ads, unrelated products, footer text, and generic site policy text. "
             "Use only the supplied evidence. Do not invent facts and do not use external knowledge. "
             "Every material product claim must carry evidence-axis tags: T=rendered product text, "
-            "V=visual evidence, S=structured metadata/JSON-LD/meta tags, D=HTML tables, I=user input context. "
-            "User input context is provenance only; never promote it as a retailer claim unless the same "
-            "claim is also supported by T, V, S, or D. Report gaps and discrepancies explicitly. "
+            "V=visual evidence, S=structured metadata/JSON-LD/meta tags, D=HTML tables, "
+            "I=user input context, U=URL-derived evidence, A=caller-supplied upstream/indexed evidence. "
+            "User input context and URL-derived evidence are valid provenance for creating the artifact, especially when browser capture is weak, but never promote I/U as browser-rendered retailer claims unless supported by T, V, S, or D. Report gaps and discrepancies explicitly. "
             "Return strict JSON only, matching the requested schema."
         ),
     )
