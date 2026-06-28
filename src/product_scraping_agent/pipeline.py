@@ -38,11 +38,23 @@ from .full_scraper import FullPage, fetch_full, fetch_best_full, merge_full_page
 from .images import download_and_describe, capture_screenshot_fallback
 from .log import logger
 from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapeRequest, ScrapedProduct, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
-from .text_utils import truncate_text
+from .text_utils import truncate_text, coerce_text_payload, safe_text_len, has_text_payload
 
 _MAX_TABLES = 40
 _MAX_REPEAT_ACTIONS = 1
 _ALLOWED_ACTIONS = {"full_page_scroll", "expand_common_sections", "extract_gallery_sources", "retry_relaxed"}
+
+
+def _normalize_page_text_payloads(page: FullPage) -> FullPage:
+    """Defensively normalize Crawl4AI text payload objects on a FullPage.
+
+    Some Crawl4AI versions return MarkdownGenerationResult-like objects. This
+    must be done before logging, metadata, artifact finalization, and quality
+    gates because all of those call len(), bool(), or file writes on page text.
+    """
+    page.raw_markdown = coerce_text_payload(getattr(page, "raw_markdown", ""))
+    page.raw_html = coerce_text_payload(getattr(page, "raw_html", ""))
+    return page
 
 
 def make_scrape_id(prefix: str = "scrape") -> str:
@@ -177,8 +189,8 @@ def _metadata_payload(
         "json_ld": page.json_ld,
         "profiles_merged": page.profiles_merged,
         "counts": {
-            "raw_html_chars": len(page.raw_html or ""),
-            "raw_markdown_chars": len(page.raw_markdown or ""),
+            "raw_html_chars": safe_text_len(page.raw_html),
+            "raw_markdown_chars": safe_text_len(page.raw_markdown),
             "image_candidates": len(page.images),
             "tables_html": len(page.tables_html),
             "json_ld_blocks": len(page.json_ld or []),
@@ -414,7 +426,7 @@ def _artifact_manifest(
             "product_details_recovered": result.product_details_recovered,
             "input_context_provided": input_context.has_any(),
             "has_url_derived_evidence": bool(result.url),
-            "has_text_evidence": bool(result.raw_markdown),
+            "has_text_evidence": has_text_payload(result.raw_markdown),
             "has_structured_data": bool(result.json_ld),
             "has_visual_evidence": bool(_clean_product_image_refs(images)),
             "has_any_visual_file": any(i.local_path for i in images),
@@ -494,8 +506,8 @@ def _deterministic_followup_action(page: FullPage, used_actions: dict[str, int])
     guardrails: if the capture is clearly thin, do one same-URL expansion before
     downstream normalization. This never searches and never changes URL.
     """
-    md_chars = len(page.raw_markdown or "")
-    html_chars = len(page.raw_html or "")
+    md_chars = safe_text_len(page.raw_markdown)
+    html_chars = safe_text_len(page.raw_html)
     image_count = len(page.images or [])
     table_count = len(page.tables_html or [])
     jsonld_count = len(page.json_ld or [])
@@ -535,6 +547,7 @@ async def _agentic_fetch_loop(
         product_hint=product_hint,
         ean=input_context.ean,
     )
+    page = _normalize_page_text_payloads(page)
     trace.append({
         "iteration": 0,
         "profile": page.capture_profile_used or page.fetch_profile,
@@ -542,8 +555,8 @@ async def _agentic_fetch_loop(
         "profile_scores": page.capture_profile_scores,
         "reason": "initial multi-profile capture",
         "counts": {
-            "markdown_chars": len(page.raw_markdown or ""),
-            "html_chars": len(page.raw_html or ""),
+            "markdown_chars": safe_text_len(page.raw_markdown),
+            "html_chars": safe_text_len(page.raw_html),
             "images": len(page.images),
             "tables": len(page.tables_html),
             "json_ld": len(page.json_ld),
@@ -587,9 +600,10 @@ async def _agentic_fetch_loop(
             )
             used_actions[action] = used_actions.get(action, 0) + 1
             followup = await fetch_full(cfg, url, profile=action, country_code=fetch_country, product_hint=product_hint, ean=input_context.ean)
-            before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
-            page = merge_full_pages(page, followup)
-            after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
+            followup = _normalize_page_text_payloads(followup)
+            before = (safe_text_len(page.raw_markdown), len(page.images), len(page.tables_html), len(page.json_ld))
+            page = _normalize_page_text_payloads(merge_full_pages(page, followup))
+            after = (safe_text_len(page.raw_markdown), len(page.images), len(page.tables_html), len(page.json_ld))
             trace.append({
                 "iteration": iteration,
                 "plan": plan.model_dump(),
@@ -619,9 +633,10 @@ async def _agentic_fetch_loop(
         used_actions[chosen.action] = used_actions.get(chosen.action, 0) + 1
         logger.info("  agent plan : iteration={} action={} reason={}", iteration, chosen.action, chosen.reason[:180])
         followup = await fetch_full(cfg, url, profile=chosen.action, country_code=fetch_country, product_hint=product_hint, ean=input_context.ean)
-        before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
-        page = merge_full_pages(page, followup)
-        after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
+        followup = _normalize_page_text_payloads(followup)
+        before = (safe_text_len(page.raw_markdown), len(page.images), len(page.tables_html), len(page.json_ld))
+        page = _normalize_page_text_payloads(merge_full_pages(page, followup))
+        after = (safe_text_len(page.raw_markdown), len(page.images), len(page.tables_html), len(page.json_ld))
         trace.append({
             "iteration": iteration,
             "plan": plan.model_dump(),
@@ -637,8 +652,8 @@ async def _agentic_fetch_loop(
 def _write_debug_raw(out_dir: Path, page: FullPage) -> Path:
     debug_dir = out_dir / "debug_raw"
     debug_dir.mkdir(parents=True, exist_ok=True)
-    _write_text(debug_dir / "observed_page.md", page.raw_markdown or "")
-    _write_text(debug_dir / "observed_page.html", page.raw_html or "")
+    _write_text(debug_dir / "observed_page.md", coerce_text_payload(page.raw_markdown))
+    _write_text(debug_dir / "observed_page.html", coerce_text_payload(page.raw_html))
     return debug_dir
 
 
@@ -856,12 +871,13 @@ async def scrape_product(
         product_hint=resolved_hint,
         max_iterations=loop_iterations,
     )
+    page = _normalize_page_text_payloads(page)
     result.agent_trace = trace
     result.agent_iterations = max(0, len([t for t in trace if t.get("executed_action")]))
     result.final_url = page.final_url or url
     result.title = page.title
-    result.raw_markdown = page.raw_markdown
-    result.raw_html = page.raw_html or ""
+    result.raw_markdown = coerce_text_payload(page.raw_markdown)
+    result.raw_html = coerce_text_payload(page.raw_html)
     result.json_ld = list(page.json_ld or [])
     result.access_status = page.access_status
     result.access_issue_type = page.access_issue_type
@@ -891,7 +907,7 @@ async def scrape_product(
     logger.info("  profiles  : selected={} attempted={}", result.capture_profile_used, ", ".join(result.capture_profiles_attempted or page.profiles_merged or [page.fetch_profile]))
     logger.info("  capture   : score={} grade={} decision={} real_scrape_evidence={} weak_reasons={}", result.capture_score, result.capture_grade, result.capture_decision, result.real_scrape_evidence, result.weak_capture_reasons)
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
-                len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
+                safe_text_len(page.raw_markdown), len(page.images), len(page.tables_html), len(page.json_ld))
     capture_health = page_capture_health(page)
     if capture_health.get("weak_capture"):
         logger.warning("  capture   : weak_capture reasons={} — artifact will still be created from URL/input evidence", capture_health.get("weak_reasons"))
@@ -902,11 +918,11 @@ async def scrape_product(
         logger.info("  debug_raw : {}", result.raw_debug_dir)
 
     recoverable_evidence_present = bool(
-        page.raw_markdown or page.raw_html or page.json_ld or page.og or page.product_meta
+        has_text_payload(page.raw_markdown) or has_text_payload(page.raw_html) or page.json_ld or page.og or page.product_meta
         or upstream_bundle.has_any()
         or input_context.has_any()
     )
-    if (not page.success or not (page.raw_markdown or page.raw_html)) and not recoverable_evidence_present:
+    if (not page.success or not (has_text_payload(page.raw_markdown) or has_text_payload(page.raw_html))) and not recoverable_evidence_present:
         result.error = page.error or page.access_issue_reason or "empty page and no recoverable evidence"
         result.elapsed_seconds = datetime.now(timezone.utc).timestamp() - t0
         result.image_required = cfg.image_required
@@ -963,7 +979,7 @@ async def scrape_product(
             pass
         logger.error("  ✗ no recoverable evidence: {}", result.error)
         return result
-    if not page.success or not (page.raw_markdown or page.raw_html):
+    if not page.success or not (has_text_payload(page.raw_markdown) or has_text_payload(page.raw_html)):
         logger.warning("  ! browser content weak/blocked; continuing with evidence recovery mode")
 
     # Step 2: Tables.

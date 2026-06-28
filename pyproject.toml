@@ -1,6 +1,6 @@
 [project]
 name = "product-scraping-agent"
-version = "1.2.5"
+version = "1.2.6"
 description = "Agentic URL-in product evidence artifact scraper with batch CSV support, source alignment, quality gates, multi-profile Crawl4AI capture, strict capture decisions, batch domain profile learning, and vision."
 requires-python = ">=3.10,<3.13"
 dependencies = [

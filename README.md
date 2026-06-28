@@ -512,3 +512,14 @@ Expected visual statuses:
 | `screenshot_fallback_only` | Screenshot fallback retained; manual review required. |
 | `image_recovery_failed` | No usable image retained. |
 | `no_image_candidates` | No image candidates discovered. |
+
+
+## v1.2.6 note — Crawl4AI markdown payload compatibility hardening
+
+Crawl4AI may return `result.markdown` as a `MarkdownGenerationResult` object rather than a plain string. v1.2.6 defensively normalizes markdown/html payloads before logging, scoring, metadata creation, worker finalization, and artifact writing. This fixes row failures like:
+
+```text
+TypeError: object of type 'MarkdownGenerationResult' has no len()
+```
+
+The row should now continue to the normal artifact or worker-safe failure artifact instead of failing during diagnostics/finalization.

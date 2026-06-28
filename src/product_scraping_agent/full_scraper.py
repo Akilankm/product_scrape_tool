@@ -735,7 +735,7 @@ async def fetch_best_full(
             "full_scraper[{}]: capture_score={} grade={} decision={} real={} weak_reasons={}",
             profile, page.capture_score, page.capture_grade, page.capture_decision, page.real_scrape_evidence, page.weak_capture_reasons,
         )
-        if best is None or (page.capture_score, len(page.raw_markdown or ""), len(page.images or [])) > (best.capture_score, len(best.raw_markdown or ""), len(best.images or [])):
+        if best is None or (page.capture_score, len(_coerce_text(page.raw_markdown)), len(page.images or [])) > (best.capture_score, len(_coerce_text(best.raw_markdown)), len(best.images or [])):
             best = page
         if page.capture_score >= cfg.scrape_profile_early_stop_score and page.real_scrape_evidence:
             logger.info("full_scraper: early stop at profile={} score={}", profile, page.capture_score)

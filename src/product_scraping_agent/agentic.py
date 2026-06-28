@@ -12,7 +12,7 @@ from .full_scraper import FullPage
 from .log import logger
 from .models import AgentPlan, ImageRef, ProductInputContext, ProductEvidence, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
 from .prompts import P
-from .text_utils import truncate_text
+from .text_utils import truncate_text, coerce_text_payload, safe_text_len, has_text_payload
 
 _MD_PLAN_CHARS = 18_000
 _MD_EVIDENCE_CHARS = 75_000
@@ -62,8 +62,8 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
             "access_attempts": page.access_attempts,
         },
         "counts": {
-            "markdown_chars": len(page.raw_markdown or ""),
-            "html_chars": len(page.raw_html or ""),
+            "markdown_chars": safe_text_len(page.raw_markdown),
+            "html_chars": safe_text_len(page.raw_html),
             "image_candidates": len(page.images),
             "tables_html": len(page.tables_html),
             "json_ld_blocks": len(page.json_ld),
@@ -77,7 +77,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
             "product_meta": sorted(page.product_meta.keys())[:50],
         },
     }
-    markdown_sample = truncate_text(page.raw_markdown or "", _MD_PLAN_CHARS)
+    markdown_sample = truncate_text(page.raw_markdown, _MD_PLAN_CHARS)
     jsonld_sample = truncate_text(json.dumps(page.json_ld, ensure_ascii=False, indent=2), 8000)
     return (
         "# Page capture summary\n"
@@ -176,8 +176,8 @@ def page_capture_health(page: FullPage) -> dict[str, Any]:
     If full_scraper's multi-profile scorer populated capture_score/grade, use
     that as the source of truth. Otherwise fall back to the older heuristics.
     """
-    md = page.raw_markdown or ""
-    html = page.raw_html or ""
+    md = coerce_text_payload(page.raw_markdown)
+    html = coerce_text_payload(page.raw_html)
     title = (page.title or "").strip()
     text = "\n".join([title, md, html[:20_000]]).lower()
     md_chars = len(md)
@@ -465,10 +465,10 @@ def normalize_product_evidence(
         "axis_S_structured": _structured_axis(page),
         "axis_D_tables": _tables_axis(tables),
         "axis_V_visual": _visual_axis(images),
-        "axis_T_rendered_markdown": truncate_text(page.raw_markdown or "", _MD_EVIDENCE_CHARS),
+        "axis_T_rendered_markdown": truncate_text(page.raw_markdown, _MD_EVIDENCE_CHARS),
         "axis_A_upstream_indexed_evidence": _upstream_axis(upstream_evidence or UpstreamEvidenceBundle()),
         # Small HTML signal helps when text markdown misses alt/data attributes; still not a raw dump.
-        "html_signal_sample": truncate_text(page.raw_html or "", _HTML_SIGNAL_CHARS),
+        "html_signal_sample": truncate_text(page.raw_html, _HTML_SIGNAL_CHARS),
     }
     user = (
         "Build the complete product-only retailer evidence JSON. Remove noise; do not summarize noisy content. "
@@ -861,9 +861,9 @@ def build_evidence_recovery_report(
         recovery_sources.append("browser_rendered_page")
     if page.proxy_used:
         recovery_sources.append("target_country_proxy")
-    if page.raw_markdown:
+    if has_text_payload(page.raw_markdown):
         recovery_sources.append("rendered_markdown")
-    if page.raw_html:
+    if has_text_payload(page.raw_html):
         recovery_sources.append("html_signal")
     if page.og or page.product_meta:
         recovery_sources.append("metadata_meta_tags")
@@ -984,7 +984,7 @@ def build_artifact_quality_report(
             or _has_any_term(blob, ["ean", "gtin", "barcode", "isbn", "sku", "mpn", "article", "artikeldetails"])
         ),
         "has_retailer_url": bool(result.final_url or page.final_url or page.url),
-        "has_product_text": bool(product_text_chars >= 80 or evidence.retailer_claims or page.raw_markdown),
+        "has_product_text": bool(product_text_chars >= 80 or evidence.retailer_claims or has_text_payload(page.raw_markdown)),
         "has_visual_evidence": bool(clean_product_images),
         "has_any_visual_file": bool(downloaded_images),
         "has_screenshot_fallback": bool(screenshot_fallback_images),

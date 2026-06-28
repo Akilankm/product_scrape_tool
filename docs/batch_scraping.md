@@ -180,3 +180,7 @@ image_failure_reason
 ```
 
 Filter `visual_evidence_status != final_product_images_available` to find products that are not ready for downstream automated coding.
+
+## v1.2.6 Crawl4AI markdown object compatibility
+
+Some Crawl4AI versions return markdown as a `MarkdownGenerationResult` object instead of a plain string. The batch runner now coerces these payloads before logging, scoring, metadata writing, and fail-safe finalization so workers do not fail with `object of type MarkdownGenerationResult has no len()`.
