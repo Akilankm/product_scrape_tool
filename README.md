@@ -43,7 +43,7 @@ OUTPUT  : noise-free product evidence artifact folder
 
 The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
-## What changed in v1.1.7
+## What changed by v1.2.2
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
@@ -234,6 +234,7 @@ S = structured metadata / meta tags
 J = JSON-LD product data
 D = HTML tables
 A = caller-supplied upstream indexed/search/AI evidence
+U = URL-derived evidence from the supplied product URL
 I = user-provided input context: main_text, EAN, retailer, country
 ```
 
@@ -389,3 +390,64 @@ The scraper now treats `product_url + main_text + ean + requested/source context
 - `T/S/D/V/A` = browser text, metadata, tables, vision/images, and optional upstream evidence when available
 
 Weak capture is recorded in `metadata.json`, `evidence_recovery_report.json`, `quality_report.json`, and `artifact_manifest.json`. `result.error` is reserved for technical failures; quality/manual-review decisions are exposed through `result.artifact_quality`, `result.requires_manual_review`, and `quality_report.json`.
+
+## Batch CSV scraping
+
+Use batch mode when URL discovery has already produced a CSV of product URLs and you need one artifact folder per row plus a mapping output.
+
+Minimum input:
+
+```csv
+input_id,product_url
+P001,https://retailer.example/product/123
+```
+
+Recommended input:
+
+```csv
+input_id,product_url,main_text,ean,requested_retailer_name,requested_country_code,source_retailer_name,source_country_code,source_url_role
+P001,https://fallback.example/product/123,Product title,1234567890123,Requested Retailer,CO,Fallback Retailer,US,global_fallback
+```
+
+Run:
+
+```bash
+pdm run python scripts/run_batch_scrape.py \
+  --input-csv data/samples/batch_input_sample.csv \
+  --output-csv data/batch_scrape_output.csv \
+  --summary-json data/batch_scrape_summary.json \
+  --output-root data/scraped \
+  --max-concurrency 2 \
+  --resume
+```
+
+Or:
+
+```bash
+pdm run scrape-batch \
+  --input-csv data/samples/batch_input_sample.csv \
+  --output-csv data/batch_scrape_output.csv \
+  --output-root data/scraped
+```
+
+Batch output maps each row to its artifact:
+
+```text
+input_id → artifact_dir → product_evidence.json / claims.md / quality_report.json
+```
+
+Key output columns:
+
+| Column | Meaning |
+|---|---|
+| `input_id` | Stable input row id. |
+| `success` | Technical scrape/artifact generation status. |
+| `artifact_quality` | Deterministic quality gate from `quality_report.json`. |
+| `requires_manual_review` | Whether downstream users should review before coding. |
+| `artifact_dir` | Root folder for the row's product evidence artifact. |
+| `product_evidence_json_path` | Primary structured handoff artifact. |
+| `claims_md_path` | Business-readable claim dossier. |
+| `source_alignment_report_path` | Requested context vs actual scraped URL source. |
+| `evidence_recovery_report_path` | Browser/URL/input/upstream evidence recovery audit. |
+
+See `docs/batch_scraping.md` for the full contract.

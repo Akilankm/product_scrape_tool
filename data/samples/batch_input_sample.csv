@@ -1,0 +1,3 @@
+input_id,product_url,main_text,ean,requested_retailer_name,requested_country_code,source_retailer_name,source_country_code,source_url_role
+P001,https://www.amazon.com/Barbie-Collectible-All-Denim-Signature-Underwear/dp/B0BHFD7BPM,THE MOVIE 2023 KEN DOLL WEARING DENIM SET,194735174539,Mercado Libre,CO,Amazon,US,global_fallback
+P002,https://www.orellfuessli.ch/shop/home/artikeldetails/A1079084180,Example toy product text,,Orell Füssli,CH,Orell Füssli,CH,primary_requested_retailer
