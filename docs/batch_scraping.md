@@ -113,3 +113,37 @@ Use conservative concurrency for retailers and LLM gateways:
 ```
 
 Increase only after confirming the target runtime, LLM gateway, and retailer access are stable.
+
+## Crawl4AI multi-profile capture fields
+
+Every row is scraped with the configured same-URL Crawl4AI profile sequence. The runner does not use Firecrawl or any external scraping API.
+
+Additional output columns:
+
+| Field | Meaning |
+|---|---|
+| `capture_profile_used` | The selected Crawl4AI profile whose capture was used as primary evidence. |
+| `capture_profiles_attempted` | All same-URL profiles attempted for this row. |
+| `capture_score` | 0–100 deterministic score for the selected browser capture. |
+| `capture_grade` | `strong`, `usable`, `weak`, or `blocked_or_shell`. |
+| `real_scrape_evidence` | Whether the selected capture contains meaningful product-page evidence beyond input/URL hints. |
+| `weak_capture_reasons` | Reasons a capture is considered weak, for example thin shell, challenge text, generic title, or few product signals. |
+
+Recommended production interpretation:
+
+| Condition | Interpretation |
+|---|---|
+| `success=true` and `real_scrape_evidence=true` | Artifact was created and Crawl4AI captured useful product evidence. |
+| `success=true` and `real_scrape_evidence=false` | Artifact was created, but the page capture was weak; review before coding. |
+| `capture_grade=blocked_or_shell` | HTTP 200 may have happened, but the product page itself was not meaningfully captured. |
+| `requires_manual_review=true` | Do not feed directly to coding without inspection. |
+
+Tune profiles in `.env`:
+
+```env
+PCA_SCRAPE_MULTI_PROFILE_ENABLED=true
+PCA_SCRAPE_PROFILE_SEQUENCE=standard,load_wait,full_page_scroll,expand_common_sections,extract_gallery_sources,shadow_iframe,retry_relaxed
+PCA_SCRAPE_PROFILE_EARLY_STOP_SCORE=82
+PCA_SCRAPE_PROFILE_MAX_PROFILES=7
+PCA_SCRAPE_ENABLE_STEALTH=true
+```

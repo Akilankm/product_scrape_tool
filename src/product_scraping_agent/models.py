@@ -396,6 +396,14 @@ class ScrapeResult(BaseModel):
     recovery_status: str = "not_evaluated"
     evidence_axes_used: list[str] = Field(default_factory=list)
 
+    capture_profile_used: str = ""
+    capture_profiles_attempted: list[str] = Field(default_factory=list)
+    capture_profile_scores: list[dict[str, Any]] = Field(default_factory=list)
+    capture_score: int = 0
+    capture_grade: str = "not_evaluated"
+    weak_capture_reasons: list[str] = Field(default_factory=list)
+    real_scrape_evidence: bool = False
+
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
     source_alignment: SourceAlignmentContext = Field(default_factory=SourceAlignmentContext)
@@ -563,6 +571,14 @@ class ScrapedProduct(BaseModel):
     recovery_status: str = "not_evaluated"
     evidence_axes_used: list[str] = Field(default_factory=list)
 
+    capture_profile_used: str = ""
+    capture_profiles_attempted: list[str] = Field(default_factory=list)
+    capture_profile_scores: list[dict[str, Any]] = Field(default_factory=list)
+    capture_score: int = 0
+    capture_grade: str = "not_evaluated"
+    weak_capture_reasons: list[str] = Field(default_factory=list)
+    real_scrape_evidence: bool = False
+
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
     source_alignment: SourceAlignmentContext = Field(default_factory=SourceAlignmentContext)
@@ -620,6 +636,13 @@ class ScrapedProduct(BaseModel):
             product_details_recovered=self.product_details_recovered,
             recovery_status=self.recovery_status,
             evidence_axes_used=self.evidence_axes_used,
+            capture_profile_used=self.capture_profile_used,
+            capture_profiles_attempted=self.capture_profiles_attempted,
+            capture_profile_scores=self.capture_profile_scores,
+            capture_score=self.capture_score,
+            capture_grade=self.capture_grade,
+            weak_capture_reasons=self.weak_capture_reasons,
+            real_scrape_evidence=self.real_scrape_evidence,
             input_context=self.input_context,
             upstream_evidence=self.upstream_evidence,
             source_alignment=self.source_alignment,

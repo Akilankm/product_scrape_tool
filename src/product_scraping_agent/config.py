@@ -42,6 +42,22 @@ class Config:
     scrape_timeout: float = _env_float("SCRAPE_TIMEOUT", 35.0)
     scrape_wait_until: str = _env("SCRAPE_WAIT_UNTIL", "domcontentloaded")
 
+    # Crawl4AI hardening: run several same-URL capture profiles and select the
+    # richest product-page capture. No external scraping service is used.
+    scrape_multi_profile_enabled: bool = _env_bool("SCRAPE_MULTI_PROFILE_ENABLED", True)
+    scrape_profile_sequence: str = _env(
+        "SCRAPE_PROFILE_SEQUENCE",
+        "standard,load_wait,full_page_scroll,expand_common_sections,extract_gallery_sources,shadow_iframe,retry_relaxed",
+    )
+    scrape_profile_early_stop_score: int = _env_int("SCRAPE_PROFILE_EARLY_STOP_SCORE", 82)
+    scrape_profile_max_profiles: int = _env_int("SCRAPE_PROFILE_MAX_PROFILES", 7)
+    scrape_enable_stealth: bool = _env_bool("SCRAPE_ENABLE_STEALTH", True)
+    scrape_user_data_dir: str = _env("SCRAPE_USER_DATA_DIR", "")
+    scrape_cookies_file: str = _env("SCRAPE_COOKIES_FILE", "")
+    scrape_user_agent: str = _env("SCRAPE_USER_AGENT", "")
+    scrape_viewport_width: int = _env_int("SCRAPE_VIEWPORT_WIDTH", 1280)
+    scrape_viewport_height: int = _env_int("SCRAPE_VIEWPORT_HEIGHT", 900)
+
     # Geo/access handling. The scraper never treats geo/access blocks as product absence.
     # Configure authorised proxy/VPN egress explicitly when target-country access is required.
     geo_proxy_enabled: bool = _env_bool("GEO_PROXY_ENABLED", False)

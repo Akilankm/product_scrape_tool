@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 from ..config import Config
@@ -111,6 +113,38 @@ _CHROME_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
 
+
+
+def _browser_config_kwargs(kwargs: dict[str, Any]):
+    """Create BrowserConfig while tolerating Crawl4AI version differences."""
+    from crawl4ai import BrowserConfig
+
+    try:
+        sig = inspect.signature(BrowserConfig)
+        accepted = {k: v for k, v in kwargs.items() if k in sig.parameters and v not in (None, "")}
+    except Exception:
+        accepted = {k: v for k, v in kwargs.items() if v not in (None, "")}
+    return BrowserConfig(**accepted)
+
+
+def _load_cookies(path: str) -> list[dict[str, Any]] | None:
+    """Load Playwright/Crawl4AI cookies from JSON if provided.
+
+    Accepted shapes: a raw list of cookie dicts or {"cookies": [...]}.
+    Invalid files are ignored with a warning so scraping still runs.
+    """
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload = payload.get("cookies", [])
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+    except Exception as exc:
+        logger.warning("scraper: could not load cookies file {} — {}", path, exc)
+    return None
+
 _shared_crawler = None  # type: ignore[var-annotated]
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _worker_thread: threading.Thread | None = None
@@ -178,18 +212,27 @@ async def _ensure_crawler_inner(cfg: Config):
             return _shared_crawler
         from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-        browser_cfg = BrowserConfig(
-            browser_type="chromium",
-            headless=cfg.scrape_headless,
-            verbose=False,
-            text_mode=False,
-            light_mode=True,
-            avoid_ads=True,
-            enable_stealth=True,
-            user_agent=_CHROME_UA,
-            viewport_width=1280,
-            viewport_height=800,
-        )
+        headers = {}
+        if cfg.accept_language:
+            headers["Accept-Language"] = cfg.accept_language
+        cookies = _load_cookies(cfg.scrape_cookies_file)
+        user_data_dir = cfg.scrape_user_data_dir.strip() or None
+        browser_cfg = _browser_config_kwargs({
+            "browser_type": "chromium",
+            "headless": cfg.scrape_headless,
+            "verbose": False,
+            "text_mode": False,
+            "light_mode": True,
+            "avoid_ads": True,
+            "enable_stealth": cfg.scrape_enable_stealth,
+            "user_agent": cfg.scrape_user_agent.strip() or _CHROME_UA,
+            "viewport_width": cfg.scrape_viewport_width,
+            "viewport_height": cfg.scrape_viewport_height,
+            "use_persistent_context": bool(user_data_dir),
+            "user_data_dir": user_data_dir,
+            "cookies": cookies,
+            "headers": headers or None,
+        })
         crawler = AsyncWebCrawler(config=browser_cfg)
         await crawler.start()
         _shared_crawler = crawler

@@ -34,7 +34,7 @@ from .agentic import (
     synthesize_claims_md_from_evidence,
 )
 from .config import Config, get_config
-from .full_scraper import FullPage, fetch_full, merge_full_pages, table_html_to_markdown
+from .full_scraper import FullPage, fetch_full, fetch_best_full, merge_full_pages, table_html_to_markdown
 from .images import download_and_describe
 from .log import logger
 from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapedProduct, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
@@ -157,6 +157,13 @@ def _metadata_payload(
         "proxy_source": page.proxy_source,
         "access_attempts": page.access_attempts,
         "capture_health": page_capture_health(page),
+        "capture_profile_used": page.capture_profile_used or page.fetch_profile,
+        "capture_profiles_attempted": page.capture_profiles_attempted,
+        "capture_profile_scores": page.capture_profile_scores,
+        "capture_score": page.capture_score,
+        "capture_grade": page.capture_grade,
+        "weak_capture_reasons": page.weak_capture_reasons,
+        "real_scrape_evidence": page.real_scrape_evidence,
         "title": page.title,
         "description": page.description,
         "canonical_url": page.canonical_url,
@@ -244,6 +251,12 @@ def _artifact_manifest(
         "raw_debug_written": bool(result.raw_debug_dir),
         "browser_visible": result.browser_visible,
         "capture_health": page_capture_health(FullPage(url=result.url, final_url=result.final_url, success=result.browser_visible, access_status=result.access_status, raw_markdown=result.raw_markdown, raw_html=result.raw_html, title=result.title, json_ld=result.json_ld)),
+        "capture_profile_used": result.capture_profile_used,
+        "capture_profiles_attempted": result.capture_profiles_attempted,
+        "capture_score": result.capture_score,
+        "capture_grade": result.capture_grade,
+        "weak_capture_reasons": result.weak_capture_reasons,
+        "real_scrape_evidence": result.real_scrape_evidence,
         "product_details_recovered": result.product_details_recovered,
         "recovery_status": result.recovery_status,
         "evidence_axes_used": result.evidence_axes_used,
@@ -296,6 +309,10 @@ def _artifact_manifest(
             "has_claims_synthesis": bool(result.claims_markdown),
             "product_page_confidence": quality.get("product_page_confidence", ""),
             "evidence_completeness": quality.get("evidence_completeness", ""),
+            "capture_score": result.capture_score,
+            "capture_grade": result.capture_grade,
+            "real_scrape_evidence": result.real_scrape_evidence,
+            "weak_capture_reasons": result.weak_capture_reasons,
             "access_status": result.access_status,
             "geo_restricted": result.geo_restricted,
             "proxy_used": result.proxy_used,
@@ -392,11 +409,19 @@ async def _agentic_fetch_loop(
     """Initial scrape plus LLM-planned same-page follow-up passes."""
     trace: list[dict[str, Any]] = []
     fetch_country = source_alignment.source_country_code or source_alignment.requested_country_code or input_context.country_code
-    page = await fetch_full(cfg, url, profile="standard", country_code=fetch_country)
+    page = await fetch_best_full(
+        cfg,
+        url,
+        country_code=fetch_country,
+        product_hint=product_hint,
+        ean=input_context.ean,
+    )
     trace.append({
         "iteration": 0,
-        "profile": "standard",
-        "reason": "initial capture",
+        "profile": page.capture_profile_used or page.fetch_profile,
+        "profiles_attempted": page.capture_profiles_attempted,
+        "profile_scores": page.capture_profile_scores,
+        "reason": "initial multi-profile capture",
         "counts": {
             "markdown_chars": len(page.raw_markdown or ""),
             "html_chars": len(page.raw_html or ""),
@@ -404,6 +429,10 @@ async def _agentic_fetch_loop(
             "tables": len(page.tables_html),
             "json_ld": len(page.json_ld),
         },
+        "capture_score": page.capture_score,
+        "capture_grade": page.capture_grade,
+        "real_scrape_evidence": page.real_scrape_evidence,
+        "weak_capture_reasons": page.weak_capture_reasons,
         "success": page.success,
         "status": page.status,
     })
@@ -437,7 +466,7 @@ async def _agentic_fetch_loop(
                 iteration, action, reason[:180],
             )
             used_actions[action] = used_actions.get(action, 0) + 1
-            followup = await fetch_full(cfg, url, profile=action, country_code=fetch_country)
+            followup = await fetch_full(cfg, url, profile=action, country_code=fetch_country, product_hint=product_hint, ean=input_context.ean)
             before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
             page = merge_full_pages(page, followup)
             after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
@@ -469,7 +498,7 @@ async def _agentic_fetch_loop(
 
         used_actions[chosen.action] = used_actions.get(chosen.action, 0) + 1
         logger.info("  agent plan : iteration={} action={} reason={}", iteration, chosen.action, chosen.reason[:180])
-        followup = await fetch_full(cfg, url, profile=chosen.action, country_code=fetch_country)
+        followup = await fetch_full(cfg, url, profile=chosen.action, country_code=fetch_country, product_hint=product_hint, ean=input_context.ean)
         before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
         page = merge_full_pages(page, followup)
         after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
@@ -716,6 +745,13 @@ async def scrape_product(
     result.proxy_used = page.proxy_used
     result.proxy_source = page.proxy_source
     result.access_attempts = list(page.access_attempts or [])
+    result.capture_profile_used = page.capture_profile_used or page.fetch_profile
+    result.capture_profiles_attempted = list(page.capture_profiles_attempted or page.profiles_merged or [page.fetch_profile])
+    result.capture_profile_scores = list(page.capture_profile_scores or [])
+    result.capture_score = int(page.capture_score or 0)
+    result.capture_grade = page.capture_grade or "not_evaluated"
+    result.weak_capture_reasons = list(page.weak_capture_reasons or [])
+    result.real_scrape_evidence = bool(page.real_scrape_evidence)
     result.browser_visible = bool(page_capture_health(page).get("browser_product_visible"))
     source_alignment_report = _build_source_alignment_report(
         source_alignment=source_alignment,
@@ -726,7 +762,8 @@ async def scrape_product(
     _write_json(agent_trace_path, trace)
     logger.info("  status    : {} success={} access={} proxy={} in {:.2f}s", page.status, page.success, page.access_status, page.proxy_source or "direct", time.monotonic() - t_step)
     logger.info("  final_url : {}", result.final_url)
-    logger.info("  profiles  : {}", ", ".join(page.profiles_merged or [page.fetch_profile]))
+    logger.info("  profiles  : selected={} attempted={}", result.capture_profile_used, ", ".join(result.capture_profiles_attempted or page.profiles_merged or [page.fetch_profile]))
+    logger.info("  capture   : score={} grade={} real_scrape_evidence={} weak_reasons={}", result.capture_score, result.capture_grade, result.real_scrape_evidence, result.weak_capture_reasons)
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
                 len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
     capture_health = page_capture_health(page)
@@ -872,6 +909,12 @@ async def scrape_product(
     evidence.quality.setdefault("proxy_source", result.proxy_source)
     evidence.quality.setdefault("upstream_evidence_present", upstream_bundle.has_any())
     evidence.quality.setdefault("browser_visible", result.browser_visible)
+    evidence.quality.setdefault("capture_profile_used", result.capture_profile_used)
+    evidence.quality.setdefault("capture_profiles_attempted", result.capture_profiles_attempted)
+    evidence.quality.setdefault("capture_score", result.capture_score)
+    evidence.quality.setdefault("capture_grade", result.capture_grade)
+    evidence.quality.setdefault("real_scrape_evidence", result.real_scrape_evidence)
+    evidence.quality.setdefault("weak_capture_reasons", result.weak_capture_reasons)
     result.evidence_axes_used = evidence_axes_from_product_evidence(evidence)
     result.product_details_recovered = deterministic_product_details_recovered(evidence)
     recovery_report = build_evidence_recovery_report(

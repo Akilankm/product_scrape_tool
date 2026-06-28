@@ -171,11 +171,10 @@ def derive_url_evidence(page: FullPage | None, product_url: str = "") -> dict[st
 
 
 def page_capture_health(page: FullPage) -> dict[str, Any]:
-    """Classify whether the browser actually captured a product page, not just HTTP 200.
+    """Classify whether the browser captured a real product page.
 
-    A small HTTP-200 shell such as a marketplace/captcha/language page must be
-    treated as weak capture. This preserves the distinction: fallback URL was
-    attempted, artifact should still be created, but browser evidence is weak.
+    If full_scraper's multi-profile scorer populated capture_score/grade, use
+    that as the source of truth. Otherwise fall back to the older heuristics.
     """
     md = page.raw_markdown or ""
     html = page.raw_html or ""
@@ -186,15 +185,16 @@ def page_capture_health(page: FullPage) -> dict[str, Any]:
     product_terms = [
         "product", "brand", "manufacturer", "ean", "gtin", "sku", "mpn", "asin",
         "price", "availability", "description", "details", "features", "specification",
-        "item model", "model number", "age", "material", "dimensions",
+        "item model", "model number", "age", "material", "dimensions", "pieces", "package",
     ]
     block_terms = [
         "captcha", "robot check", "not a robot", "automated access", "enable javascript and cookies",
-        "enter the characters", "validatecaptcha", "sorry", "access denied", "request blocked",
+        "enter the characters", "validatecaptcha", "access denied", "request blocked",
+        "verifica tu identidad", "verify your identity", "unusual traffic",
     ]
     product_signal_count = sum(1 for term in product_terms if term in text)
     block_signal_count = sum(1 for term in block_terms if term in text)
-    generic_title = title.lower() in {"amazon.com", "amazon", "access denied", "robot check", "captcha"} or not title
+    generic_title = title.lower() in {"amazon.com", "amazon", "access denied", "robot check", "captcha", "verifica tu identidad"} or not title
     structured_count = len(page.json_ld or []) + len(page.tables_html or []) + len(page.og or {}) + len(page.product_meta or {})
     image_count = len(page.images or [])
 
@@ -210,13 +210,27 @@ def page_capture_health(page: FullPage) -> dict[str, Any]:
     if product_signal_count < 2 and md_chars < 2500 and structured_count == 0:
         weak_reasons.append("few_product_signals")
 
-    browser_product_visible = bool(page.success and page.access_status == "accessible" and not weak_reasons)
+    capture_score = int(getattr(page, "capture_score", 0) or 0)
+    capture_grade = str(getattr(page, "capture_grade", "") or "")
+    scorer_reasons = list(getattr(page, "weak_capture_reasons", []) or [])
+    real_scrape_evidence = bool(getattr(page, "real_scrape_evidence", False))
+    if scorer_reasons:
+        weak_reasons = list(dict.fromkeys([*weak_reasons, *scorer_reasons]))
+    if capture_score:
+        browser_product_visible = bool(page.success and page.access_status == "accessible" and real_scrape_evidence and capture_grade in {"strong", "usable"})
+    else:
+        browser_product_visible = bool(page.success and page.access_status == "accessible" and not weak_reasons)
     status = "product_visible" if browser_product_visible else ("weak_capture" if page.success or html or md else "not_captured")
     return {
         "browser_product_visible": browser_product_visible,
         "capture_status": status,
         "weak_capture": not browser_product_visible,
-        "weak_reasons": weak_reasons,
+        "weak_reasons": list(dict.fromkeys(weak_reasons)),
+        "capture_score": capture_score,
+        "capture_grade": capture_grade or "not_evaluated",
+        "capture_profile_used": getattr(page, "capture_profile_used", "") or getattr(page, "fetch_profile", ""),
+        "capture_profiles_attempted": list(getattr(page, "capture_profiles_attempted", []) or []),
+        "real_scrape_evidence": real_scrape_evidence,
         "markdown_chars": md_chars,
         "html_chars": html_chars,
         "title": title,
@@ -238,6 +252,13 @@ def _structured_axis(page: FullPage) -> dict[str, Any]:
         "product_meta": page.product_meta,
         "json_ld": page.json_ld,
         "profiles_merged": page.profiles_merged,
+        "capture_profile_used": page.capture_profile_used or page.fetch_profile,
+        "capture_profiles_attempted": page.capture_profiles_attempted,
+        "capture_profile_scores": page.capture_profile_scores,
+        "capture_score": page.capture_score,
+        "capture_grade": page.capture_grade,
+        "real_scrape_evidence": page.real_scrape_evidence,
+        "weak_capture_reasons": page.weak_capture_reasons,
         "access_status": page.access_status,
         "access_issue_type": page.access_issue_type,
         "access_issue_reason": page.access_issue_reason,
@@ -992,6 +1013,10 @@ def build_artifact_quality_report(
     capture = page_capture_health(page)
     if capture.get("weak_capture") and result.access_status == "accessible":
         warnings.append("HTTP 200 returned but product-page capture is weak; artifact relies on input/URL/context evidence where needed")
+    if not getattr(result, "real_scrape_evidence", False):
+        warnings.append("no strong Crawl4AI product-page capture selected; artifact may rely on input/URL evidence")
+    if getattr(result, "capture_grade", "") in {"weak", "blocked_or_shell"}:
+        warnings.append(f"selected Crawl4AI capture grade is {getattr(result, 'capture_grade', '')}")
     if source_alignment.alignment_status != "primary_requested_source":
         warnings.append(f"source alignment is {source_alignment.alignment_status}; source-specific commercial claims are scoped to {source_alignment.source_specific_claim_scope}")
 
@@ -1010,6 +1035,12 @@ def build_artifact_quality_report(
     if claims_count >= 5:
         score += 5
     if len(warnings) >= 3:
+        score -= 10
+    if not getattr(result, "real_scrape_evidence", False):
+        score -= 15
+    if getattr(result, "capture_grade", "") == "blocked_or_shell":
+        score -= 20
+    elif getattr(result, "capture_grade", "") == "weak":
         score -= 10
     score = max(0, min(100, score))
 
@@ -1061,6 +1092,15 @@ def build_artifact_quality_report(
             "json_ld_blocks": len(page.json_ld or []),
         },
         "source_alignment": source_alignment.model_report(),
+        "capture": {
+            "capture_profile_used": getattr(result, "capture_profile_used", ""),
+            "capture_profiles_attempted": getattr(result, "capture_profiles_attempted", []),
+            "capture_score": getattr(result, "capture_score", 0),
+            "capture_grade": getattr(result, "capture_grade", "not_evaluated"),
+            "real_scrape_evidence": getattr(result, "real_scrape_evidence", False),
+            "weak_capture_reasons": getattr(result, "weak_capture_reasons", []),
+            "capture_health": capture,
+        },
         "access": {
             "access_status": result.access_status,
             "browser_visible": result.browser_visible,

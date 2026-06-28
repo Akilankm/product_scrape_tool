@@ -43,28 +43,63 @@ OUTPUT  : noise-free product evidence artifact folder
 
 The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
-## What changed by v1.2.2
+## What changed by v1.2.3
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
 ```text
-1. Initial Crawl4AI render of the supplied product URL
-2. LLM planner checks whether evidence is complete enough
-3. If needed, planner triggers same-URL follow-up capture only:
+1. Multi-profile Crawl4AI capture of the supplied product URL only
+   - standard
+   - load_wait
+   - full_page_scroll
+   - expand_common_sections
+   - extract_gallery_sources
+   - shadow_iframe
+   - retry_relaxed
+2. Each profile is scored for real product evidence, not just HTTP 200
+3. The richest valid same-URL capture is selected before LLM normalization
+4. LLM planner can still trigger additional same-URL follow-up capture only:
    - full_page_scroll
    - expand_common_sections
    - extract_gallery_sources
    - retry_relaxed
-4. Images are downloaded, deduplicated, relevance-gated, and vision-described
-5. LLM normalizer creates product-only evidence JSON/Markdown
-6. claims.md is generated only from normalized product evidence
-7. If browser access is blocked/weak, Evidence Recovery Mode can use caller-supplied upstream AI/search evidence without performing search itself
-8. Image CDN recovery retries with browser-like headers/referers and optional Playwright request fallback
-9. Deterministic quality gate writes `quality_report.json` for downstream acceptance/manual-review decisions
-10. Source alignment separates the requested retailer/country from the actual URL evidence source so fallback URLs do not leak retailer-specific claims
+5. Images are downloaded, deduplicated, relevance-gated, and vision-described
+6. LLM normalizer creates product-only evidence JSON/Markdown
+7. claims.md is generated only from normalized product evidence
+8. If browser access is blocked/weak, Evidence Recovery Mode can use caller-supplied upstream AI/search evidence without performing search itself
+9. Image CDN recovery retries with browser-like headers/referers and optional Playwright request fallback
+10. Deterministic quality gate writes `quality_report.json` for downstream acceptance/manual-review decisions
+11. Source alignment separates the requested retailer/country from the actual URL evidence source so fallback URLs do not leak retailer-specific claims
 ```
 
 No web search is performed inside this scraper. No external facts are used unless the caller supplies them as upstream evidence, and those claims are explicitly tagged with `A` evidence axis. No guesses are allowed.
+
+## Crawl4AI multi-profile capture
+
+The scraper is Crawl4AI-only. It does not use Firecrawl or any paid scraping backend.
+
+Configure the same-URL profile sequence in `.env`:
+
+```env
+PCA_SCRAPE_MULTI_PROFILE_ENABLED=true
+PCA_SCRAPE_PROFILE_SEQUENCE=standard,load_wait,full_page_scroll,expand_common_sections,extract_gallery_sources,shadow_iframe,retry_relaxed
+PCA_SCRAPE_PROFILE_EARLY_STOP_SCORE=82
+PCA_SCRAPE_PROFILE_MAX_PROFILES=7
+PCA_SCRAPE_ENABLE_STEALTH=true
+```
+
+Every run records capture diagnostics in `metadata.json`, `quality_report.json`, `artifact_manifest.json`, `agent_trace.json`, `scrape_result.json`, and the batch output CSV:
+
+```text
+capture_profile_used
+capture_profiles_attempted
+capture_score
+capture_grade
+real_scrape_evidence
+weak_capture_reasons
+```
+
+This prevents a thin HTTP-200 shell page from being treated as a successful product scrape.
 
 ## Install
 

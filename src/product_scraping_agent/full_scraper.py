@@ -14,6 +14,7 @@ import os
 import re
 from html.parser import HTMLParser
 from urllib.parse import urljoin
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,6 +46,37 @@ _ACCESS_BLOCK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bot_challenge", re.compile(r"\b(captcha|cloudflare|verify you are human|checking your browser|robot check|bot protection|automated access|not a robot|validatecaptcha|enter the characters you see below|enable javascript and cookies)\b", re.I)),
     ("rate_limited", re.compile(r"\b(too many requests|rate limit|temporarily blocked)\b", re.I)),
 )
+
+
+_GENERIC_TITLES = {"", "amazon.com", "amazon", "access denied", "robot check", "captcha", "verifica tu identidad"}
+_PRODUCT_TERMS = (
+    "product", "brand", "manufacturer", "ean", "gtin", "sku", "mpn", "asin",
+    "price", "availability", "description", "details", "features", "specification",
+    "item model", "model number", "age", "material", "dimensions", "pieces",
+    "toy", "doll", "figure", "set", "package", "contents", "warning",
+)
+_BLOCK_TERMS = (
+    "captcha", "robot check", "not a robot", "automated access", "enable javascript and cookies",
+    "enter the characters", "validatecaptcha", "access denied", "request blocked", "verifica tu identidad",
+    "verify your identity", "checking your browser", "unusual traffic",
+)
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.split(r"[^A-Za-z0-9]+", (text or "").lower()) if len(t) >= 3]
+
+
+def _hint_match_score(text: str, product_hint: str = "", ean: str = "") -> int:
+    text_l = (text or "").lower()
+    score = 0
+    if ean and ean in text_l:
+        score += 20
+    hint_tokens = [t for t in _tokens(product_hint) if not t.isdigit()]
+    if hint_tokens:
+        unique = list(dict.fromkeys(hint_tokens[:24]))
+        hits = sum(1 for t in unique if t in text_l)
+        score += min(18, hits * 3)
+    return score
 
 
 def _classify_access_issue(status: int, html: str = "", markdown: str = "", error: str = "") -> tuple[str, str, bool]:
@@ -105,6 +137,17 @@ class FullPage(BaseModel):
     images: list[tuple[str, str]] = Field(default_factory=list)
     tables_html: list[str] = Field(default_factory=list)
     profiles_merged: list[str] = Field(default_factory=list)
+
+    # Multi-profile capture diagnostics. These are populated by fetch_full() and
+    # fetch_best_full() so downstream quality/batch output can distinguish
+    # "artifact created" from "real product page captured".
+    capture_score: int = 0
+    capture_grade: str = "not_evaluated"
+    weak_capture_reasons: list[str] = Field(default_factory=list)
+    real_scrape_evidence: bool = False
+    capture_profile_used: str = ""
+    capture_profiles_attempted: list[str] = Field(default_factory=list)
+    capture_profile_scores: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class _Walker(HTMLParser):
@@ -329,31 +372,305 @@ def _crawler_config_kwargs(kwargs: dict):
 
 
 def _profile_js(profile: str) -> str | None:
-    if profile not in {"expand_common_sections", "extract_gallery_sources"}:
+    """JavaScript snippets for same-URL capture profiles.
+
+    These snippets intentionally do not navigate away from the URL. They only
+    scroll, expand visible sections, and stimulate lazy galleries so Crawl4AI can
+    capture the product content already present behind dynamic UI.
+    """
+    if profile in {"standard", "load_wait", "shadow_iframe", "retry_relaxed"}:
         return None
-    return r"""
+    if profile == "full_page_scroll":
+        return r"""
 (async () => {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const textRe = /(show more|read more|more info|details|description|specification|specifications|parameters|technical|product information|features|manufacturer|safety|see more|expand|weiter|mehr|více|parametry|popis|specifikace|detaily)/i;
-  const nodes = Array.from(document.querySelectorAll('button,a,[role="button"],[aria-expanded="false"],summary'));
+  const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  for (let y = 0; y <= h; y += Math.max(450, Math.floor(window.innerHeight * 0.75))) {
+    window.scrollTo(0, y); await sleep(180);
+  }
+  window.scrollTo(0, 0); await sleep(500);
+})();
+"""
+    if profile == "extract_gallery_sources":
+        return r"""
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const selectors = [
+    'img', '[data-src]', '[data-srcset]', '[data-zoom-image]', '[data-large]', '[data-full]',
+    '[data-image]', '[data-product-image]', '[data-a-dynamic-image]', '[data-old-hires]',
+    '.thumb, .thumbnail, [class*=thumb], [class*=gallery], [class*=carousel]'
+  ];
+  const nodes = Array.from(document.querySelectorAll(selectors.join(','))).slice(0, 160);
+  for (const el of nodes) {
+    try { el.scrollIntoView({block:'center', inline:'center'}); await sleep(80); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mouseenter', {bubbles:true})); } catch(e) {}
+    try { if ((el.tagName || '').toLowerCase() !== 'a') el.click(); } catch(e) {}
+    await sleep(120);
+  }
+  window.scrollTo(0, 0); await sleep(500);
+})();
+"""
+    if profile == "expand_common_sections":
+        return r"""
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const textRe = /(show more|read more|more info|details|description|specification|specifications|parameters|technical|product information|features|manufacturer|safety|see more|expand|weiter|mehr|více|parametry|popis|specifikace|detaily|ver más|más información|características|descripción|ficha técnica)/i;
+  const nodes = Array.from(document.querySelectorAll('button,a,[role="button"],[aria-expanded="false"],summary,label'));
   let clicked = 0;
   for (const el of nodes) {
     const label = `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
     const rect = el.getBoundingClientRect();
     const visible = rect.width > 0 && rect.height > 0;
-    if (visible && textRe.test(label) && clicked < 24) {
-      try { el.click(); clicked++; await sleep(250); } catch(e) {}
+    if (visible && textRe.test(label) && clicked < 32) {
+      try { el.scrollIntoView({block:'center'}); await sleep(120); el.click(); clicked++; await sleep(280); } catch(e) {}
     }
   }
   for (let y = 0; y <= document.body.scrollHeight; y += Math.max(400, Math.floor(window.innerHeight * 0.8))) {
-    window.scrollTo(0, y); await sleep(120);
+    window.scrollTo(0, y); await sleep(140);
   }
-  window.scrollTo(0, 0); await sleep(300);
+  window.scrollTo(0, 0); await sleep(500);
 })();
 """
+    return None
 
 
-async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", country_code: str = "") -> FullPage:
+def _profile_sequence(cfg: Config) -> list[str]:
+    raw = cfg.scrape_profile_sequence or "standard"
+    profiles = [p.strip().lower() for p in re.split(r"[,;\s]+", raw) if p.strip()]
+    allowed = [
+        "standard", "load_wait", "full_page_scroll", "expand_common_sections",
+        "extract_gallery_sources", "shadow_iframe", "retry_relaxed",
+    ]
+    out: list[str] = []
+    for p in profiles:
+        if p in allowed and p not in out:
+            out.append(p)
+    if "standard" not in out:
+        out.insert(0, "standard")
+    return out[: max(1, cfg.scrape_profile_max_profiles)]
+
+
+def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str = "") -> dict[str, Any]:
+    """Score whether a Crawl4AI profile captured real product evidence.
+
+    HTTP 200 alone is not enough. The score rewards product-like text, structured
+    data, tables, image candidates, and product/EAN matches; it penalizes
+    challenge pages and very thin shells.
+    """
+    md = _coerce_text(page.raw_markdown)
+    html = _coerce_text(page.raw_html)
+    title = (page.title or "").strip()
+    text = "\n".join([title, page.description or "", md, html[:25_000]]).lower()
+    md_chars = len(md)
+    html_chars = len(html)
+    product_signal_count = sum(1 for term in _PRODUCT_TERMS if term in text)
+    block_signal_count = sum(1 for term in _BLOCK_TERMS if term in text)
+    generic_title = title.lower() in _GENERIC_TITLES or not title
+    structured_count = len(page.json_ld or []) + len(page.tables_html or []) + len(page.og or {}) + len(page.product_meta or {})
+    image_count = len(page.images or [])
+
+    score = 0
+    reasons: list[str] = []
+    positives: list[str] = []
+
+    if page.access_status == "accessible" and page.success:
+        score += 12; positives.append("accessible_success")
+    elif page.access_status == "accessible":
+        score += 5; positives.append("accessible_payload")
+    else:
+        score -= 25; reasons.append(f"access_status={page.access_status}")
+
+    if md_chars >= 12_000:
+        score += 30; positives.append("rich_markdown")
+    elif md_chars >= 6_000:
+        score += 22; positives.append("good_markdown")
+    elif md_chars >= 2_500:
+        score += 13; positives.append("moderate_markdown")
+    elif md_chars >= 900:
+        score += 6; positives.append("thin_markdown")
+    else:
+        reasons.append("very_low_markdown")
+
+    if html_chars >= 80_000:
+        score += 12; positives.append("rich_html")
+    elif html_chars >= 25_000:
+        score += 8; positives.append("good_html")
+    elif html_chars < 5_000 and md_chars < 2_500:
+        score -= 10; reasons.append("very_low_html")
+
+    if not generic_title:
+        score += 8; positives.append("specific_title")
+    else:
+        score -= 7; reasons.append("generic_or_missing_title")
+
+    if page.json_ld:
+        score += min(28, 18 + len(page.json_ld) * 5); positives.append("json_ld")
+    if page.tables_html:
+        score += min(18, 8 + len(page.tables_html) * 4); positives.append("tables")
+    if page.og or page.product_meta:
+        score += min(12, 4 + len(page.og) + len(page.product_meta)); positives.append("meta_tags")
+    if image_count >= 12:
+        score += 12; positives.append("many_image_candidates")
+    elif image_count >= 4:
+        score += 7; positives.append("image_candidates")
+    elif image_count == 0:
+        reasons.append("no_image_candidates")
+
+    if product_signal_count >= 8:
+        score += 15; positives.append("many_product_terms")
+    elif product_signal_count >= 3:
+        score += 8; positives.append("some_product_terms")
+    elif product_signal_count < 2:
+        reasons.append("few_product_signals")
+
+    hint_score = _hint_match_score(text, product_hint, ean)
+    if hint_score:
+        score += hint_score; positives.append("input_identity_match")
+    elif product_hint or ean:
+        reasons.append("no_input_identity_match")
+
+    if block_signal_count:
+        score -= min(60, 30 + block_signal_count * 8); reasons.append("block_or_challenge_terms")
+    if md_chars < 1200 and html_chars < 8000 and structured_count == 0:
+        score -= 18; reasons.append("thin_shell_no_structured_evidence")
+    if generic_title and md_chars < 2500:
+        score -= 12; reasons.append("generic_title_with_low_text")
+
+    score = max(0, min(100, score))
+    if score >= 78:
+        grade = "strong"
+    elif score >= 58:
+        grade = "usable"
+    elif score >= 35:
+        grade = "weak"
+    else:
+        grade = "blocked_or_shell"
+    real_evidence = grade in {"strong", "usable"} or bool(page.json_ld or page.tables_html or (md_chars >= 2500 and product_signal_count >= 3))
+    return {
+        "profile": page.fetch_profile,
+        "score": score,
+        "grade": grade,
+        "real_scrape_evidence": bool(real_evidence and block_signal_count == 0),
+        "weak_capture": grade in {"weak", "blocked_or_shell"} or block_signal_count > 0,
+        "weak_reasons": list(dict.fromkeys(reasons)),
+        "positive_signals": list(dict.fromkeys(positives)),
+        "markdown_chars": md_chars,
+        "html_chars": html_chars,
+        "title": title,
+        "product_signal_count": product_signal_count,
+        "block_signal_count": block_signal_count,
+        "structured_signal_count": structured_count,
+        "image_candidate_count": image_count,
+        "access_status": page.access_status,
+        "status": page.status,
+        "success": page.success,
+    }
+
+
+def _apply_capture_score(page: FullPage, *, product_hint: str = "", ean: str = "") -> FullPage:
+    diag = score_full_page_capture(page, product_hint=product_hint, ean=ean)
+    page.capture_score = int(diag["score"])
+    page.capture_grade = str(diag["grade"])
+    page.weak_capture_reasons = list(diag.get("weak_reasons") or [])
+    page.real_scrape_evidence = bool(diag.get("real_scrape_evidence"))
+    page.capture_profile_used = page.fetch_profile
+    if not page.capture_profiles_attempted:
+        page.capture_profiles_attempted = [page.fetch_profile]
+    if not page.capture_profile_scores:
+        page.capture_profile_scores = [diag]
+    return page
+
+
+def _merge_auxiliary_signals(primary: FullPage, extra: FullPage) -> FullPage:
+    """Merge non-noisy structured/image/table signals from another profile.
+
+    We avoid appending weak/block-page text into the selected capture, but keep
+    useful images/tables/metadata discovered by gallery/section profiles.
+    """
+    if not extra or extra is primary:
+        return primary
+    p = primary.model_copy(deep=True)
+    p.access_attempts.extend(extra.access_attempts or [])
+    p.capture_profiles_attempted = list(dict.fromkeys([*p.capture_profiles_attempted, extra.fetch_profile, *extra.capture_profiles_attempted]))
+    existing_scores = {d.get("profile") for d in p.capture_profile_scores if isinstance(d, dict)}
+    for d in extra.capture_profile_scores or [score_full_page_capture(extra)]:
+        if isinstance(d, dict) and d.get("profile") not in existing_scores:
+            p.capture_profile_scores.append(d)
+            existing_scores.add(d.get("profile"))
+    p.profiles_merged = list(dict.fromkeys([*p.profiles_merged, *extra.profiles_merged, extra.fetch_profile]))
+    if not p.title and extra.title:
+        p.title = extra.title
+    if not p.description and extra.description:
+        p.description = extra.description
+    if not p.canonical_url and extra.canonical_url:
+        p.canonical_url = extra.canonical_url
+    p.og.update(extra.og or {})
+    p.product_meta.update(extra.product_meta or {})
+    seen_json = {repr(x) for x in p.json_ld}
+    for block in extra.json_ld or []:
+        key = repr(block)
+        if key not in seen_json:
+            seen_json.add(key); p.json_ld.append(block)
+    seen_img = {src for src, _ in p.images}
+    for src, alt in extra.images or []:
+        if src not in seen_img:
+            seen_img.add(src); p.images.append((src, alt))
+    seen_tables = {t for t in p.tables_html}
+    for html in extra.tables_html or []:
+        if html not in seen_tables:
+            seen_tables.add(html); p.tables_html.append(html)
+    return p
+
+
+async def fetch_best_full(
+    cfg: Config,
+    url: str,
+    *,
+    country_code: str = "",
+    product_hint: str = "",
+    ean: str = "",
+) -> FullPage:
+    """Run multiple Crawl4AI profiles and return the richest same-URL capture."""
+    profiles = _profile_sequence(cfg) if cfg.scrape_multi_profile_enabled else ["standard"]
+    best: FullPage | None = None
+    captures: list[FullPage] = []
+    logger.info("full_scraper: multi-profile sequence={}", ", ".join(profiles))
+    for profile in profiles:
+        page = await fetch_full(cfg, url, profile=profile, country_code=country_code, product_hint=product_hint, ean=ean)
+        captures.append(page)
+        logger.info(
+            "full_scraper[{}]: capture_score={} grade={} real={} weak_reasons={}",
+            profile, page.capture_score, page.capture_grade, page.real_scrape_evidence, page.weak_capture_reasons,
+        )
+        if best is None or (page.capture_score, len(page.raw_markdown or ""), len(page.images or [])) > (best.capture_score, len(best.raw_markdown or ""), len(best.images or [])):
+            best = page
+        if page.capture_score >= cfg.scrape_profile_early_stop_score and page.real_scrape_evidence:
+            logger.info("full_scraper: early stop at profile={} score={}", profile, page.capture_score)
+            break
+    assert best is not None
+    selected = best.model_copy(deep=True)
+    selected.capture_profile_used = best.fetch_profile
+    selected.capture_profiles_attempted = [c.fetch_profile for c in captures]
+    selected.capture_profile_scores = [score_full_page_capture(c, product_hint=product_hint, ean=ean) for c in captures]
+    # Add non-text signals from other captures without contaminating selected text.
+    for cap in captures:
+        if cap.fetch_profile != selected.fetch_profile and cap.capture_score >= 25:
+            selected = _merge_auxiliary_signals(selected, cap)
+    # Re-score after auxiliary merge.
+    _apply_capture_score(selected, product_hint=product_hint, ean=ean)
+    selected.capture_profile_used = best.fetch_profile
+    selected.capture_profiles_attempted = [c.fetch_profile for c in captures]
+    selected.capture_profile_scores = [score_full_page_capture(c, product_hint=product_hint, ean=ean) for c in captures]
+    logger.info(
+        "full_scraper: selected profile={} score={} grade={} attempted={}",
+        selected.capture_profile_used, selected.capture_score, selected.capture_grade, ", ".join(selected.capture_profiles_attempted),
+    )
+    return selected
+
+
+
+async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", country_code: str = "", product_hint: str = "", ean: str = "") -> FullPage:
     """Render a product URL with Crawl4AI and extract text/html/images/tables."""
     try:
         from crawl4ai import CacheMode
@@ -362,20 +679,22 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", countr
 
     base_timeout_ms = int(cfg.scrape_timeout * 1000)
     env_scan_full = os.getenv("PCA_SCAN_FULL_PAGE", "0").lower() in {"1", "true", "yes"}
-    scan_full = env_scan_full or profile in {"full_page_scroll", "expand_common_sections", "extract_gallery_sources"}
+    scan_full = env_scan_full or profile in {"full_page_scroll", "expand_common_sections", "extract_gallery_sources", "shadow_iframe"}
 
     def _mk_run_cfg(timeout_ms: int, *, last_ditch: bool = False, proxy_url: str = ""):
         kwargs = {
             "cache_mode": CacheMode.BYPASS,
             "page_timeout": timeout_ms,
-            "wait_until": "domcontentloaded" if last_ditch else cfg.scrape_wait_until,
-            "delay_before_return_html": 2.0 if profile != "standard" else (1.5 if last_ditch else 0.5),
+            "wait_until": "domcontentloaded" if last_ditch else ("load" if profile in {"load_wait", "shadow_iframe"} else cfg.scrape_wait_until),
+            "delay_before_return_html": (4.0 if profile in {"load_wait", "shadow_iframe"} else (3.0 if profile != "standard" else (1.5 if last_ditch else 0.5))),
             "word_count_threshold": 5,
             "exclude_external_links": False,
             "remove_overlay_elements": not last_ditch,
             "verbose": False,
             "scan_full_page": False if last_ditch else scan_full,
             "screenshot": False,
+            "process_iframes": profile == "shadow_iframe",
+            "flatten_shadow_dom": profile == "shadow_iframe",
         }
         if proxy_url:
             kwargs["proxy_config"] = proxy_url
@@ -555,8 +874,9 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", countr
         out.images = list(merged_imgs.items())
         out.tables_html = walker.tables_html
 
+    _apply_capture_score(out, product_hint=product_hint, ean=ean)
     logger.info(
-        "full_scraper[{}]: status={} access={} proxy={} html={}KB md={}KB images={} tables={} json_ld={}",
+        "full_scraper[{}]: status={} access={} proxy={} html={}KB md={}KB images={} tables={} json_ld={} score={} grade={}",
         profile,
         out.status,
         out.access_status,
@@ -566,6 +886,8 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard", countr
         len(out.images),
         len(out.tables_html),
         len(out.json_ld),
+        out.capture_score,
+        out.capture_grade,
     )
     return out
 
@@ -601,6 +923,12 @@ def merge_full_pages(primary: FullPage, extra: FullPage) -> FullPage:
     p.og.update(extra.og)
     p.product_meta.update(extra.product_meta)
     p.profiles_merged = list(dict.fromkeys([*p.profiles_merged, *extra.profiles_merged, extra.fetch_profile]))
+    p.capture_profiles_attempted = list(dict.fromkeys([*p.capture_profiles_attempted, extra.fetch_profile, *extra.capture_profiles_attempted]))
+    existing_score_profiles = {d.get("profile") for d in p.capture_profile_scores if isinstance(d, dict)}
+    for d in extra.capture_profile_scores or [score_full_page_capture(extra)]:
+        if isinstance(d, dict) and d.get("profile") not in existing_score_profiles:
+            p.capture_profile_scores.append(d)
+            existing_score_profiles.add(d.get("profile"))
 
     p.raw_markdown = _coerce_text(p.raw_markdown)
     extra_md = _coerce_text(extra.raw_markdown)
@@ -630,6 +958,9 @@ def merge_full_pages(primary: FullPage, extra: FullPage) -> FullPage:
         if html not in seen_tables:
             seen_tables.add(html)
             p.tables_html.append(html)
+    # Preserve the best score if already computed; otherwise produce a generic diagnostic.
+    if not p.capture_score:
+        _apply_capture_score(p)
     return p
 
 
@@ -697,4 +1028,4 @@ def table_html_to_markdown(html: str) -> tuple[str, str, int, int]:
     return "\n".join(lines), parser.caption, len(normalized), cols
 
 
-__all__ = ["FullPage", "fetch_full", "merge_full_pages", "table_html_to_markdown"]
+__all__ = ["FullPage", "fetch_full", "fetch_best_full", "merge_full_pages", "table_html_to_markdown", "score_full_page_capture"]
