@@ -222,7 +222,7 @@ def _artifact_manifest(
 ) -> dict[str, Any]:
     quality = evidence.quality if evidence else {}
     return {
-        "artifact_version": "product_scrape.v5.quality_hardened",
+        "artifact_version": "product_scrape.v6.clean_images_table_md",
         "scrape_id": scrape_id,
         "input_context": input_context.model_dump(),
         "product_hint": product_hint,
@@ -436,21 +436,46 @@ def _write_debug_raw(out_dir: Path, page: FullPage) -> Path:
     return debug_dir
 
 
+def _md_cell(value: Any, *, max_len: int = 700) -> str:
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip().replace("|", "\\|")
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
 def _source_md_from_product_evidence(evidence: ProductEvidence) -> str:
-    """source.md is intentionally product-only, not a raw page dump."""
+    """source.md is product-only and table-first, not a raw page dump."""
     data = evidence.model_dump()
-    lines = ["# Product-only source evidence", ""]
-    lines.append("This file contains product-relevant text blocks selected from the retailer page. It intentionally excludes navigation, footer, ads, recommendations, and generic site boilerplate.\n")
+    lines = [
+        "# Product-only Source Evidence",
+        "",
+        "This file contains only product-relevant text blocks selected from the retailer page/evidence. Navigation, footer, ads, recommendations, cookie text, and generic boilerplate are intentionally excluded.",
+        "",
+        "| # | Section | Evidence axes | Product-only extracted text |",
+        "|---:|---|---|---|",
+    ]
     blocks = data.get("product_only_text_blocks") or []
     if not blocks:
-        lines.append("No normalized product-only text blocks were produced. See product_evidence.json for captured structured/table/visual claims.")
-    for b in blocks:
-        heading = b.get("heading") or "Product text"
-        content = (b.get("content") or "").strip()
-        axes = b.get("evidence_axis") or ["T"]
-        lines.append(f"## {heading} ({','.join(axes)})")
-        lines.append(content or "(empty)")
-        lines.append("")
+        lines.append("| 1 | Not captured |  | No normalized product-only text block was produced. See `product_evidence.json` for structured/table/visual evidence. |")
+    else:
+        for i, b in enumerate(blocks, start=1):
+            heading = b.get("heading") or "Product text"
+            content = (b.get("content") or "").strip()
+            axes = b.get("evidence_axis") or ["T"]
+            lines.append(
+                f"| {i} | {_md_cell(heading, max_len=180)} | {_md_cell(','.join(str(a) for a in axes), max_len=80)} | {_md_cell(content, max_len=900)} |"
+            )
+    lines.extend([
+        "",
+        "## Source policy",
+        "",
+        "| Rule | Decision |",
+        "|---|---|",
+        "| Raw page dump | Not emitted here |",
+        "| Noisy site content | Excluded |",
+        "| Product claims | Retained only when evidence-grounded |",
+    ])
     return "\n".join(lines).strip() + "\n"
 
 

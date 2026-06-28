@@ -56,9 +56,11 @@ class P:
     CLAIMS_MD = PromptSpec(
         name="product_claims_synthesis",
         system=(
-            "You create the final auditable retailer product dossier from an already-normalized "
-            "product-only evidence JSON. Do not reintroduce noisy page content. Use only the supplied "
-            "normalized evidence. Keep claims explicit, grounded, and source-tagged. If evidence is "
-            "missing, say so under Gaps. If sources disagree, state the discrepancy."
+            "You create a business-readable, decision-level retailer product dossier from an "
+            "already-normalized product-only evidence JSON. Do not reintroduce noisy page content. "
+            "Use only the supplied normalized evidence. Prefer compact markdown tables over prose. "
+            "Every material row must include evidence axes and confidence. If evidence is missing, "
+            "say so in a Gaps table. If sources disagree, state the discrepancy in a Discrepancies table. "
+            "No guessing, no external knowledge, no hard-coded assumptions."
         ),
     )

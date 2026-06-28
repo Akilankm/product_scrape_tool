@@ -396,92 +396,174 @@ def deterministic_product_evidence(
     )
 
 
-def render_product_evidence_md(evidence: ProductEvidence) -> str:
-    """Render normalized evidence JSON into a human-readable markdown artifact."""
-    data = evidence.model_dump()
-    lines: list[str] = ["# Product-only retailer evidence", ""]
-    if evidence.product_focus_summary:
-        lines += ["## Product focus summary", evidence.product_focus_summary.strip(), ""]
 
-    lines += ["## Product identity", ""]
+def _cell(value: Any, *, max_len: int = 260) -> str:
+    """Markdown table-safe compact cell."""
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("|", "\\|")
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _axes_cell(claim: dict[str, Any]) -> str:
+    axes = claim.get("evidence_axis") or claim.get("evidence_axes") or []
+    if isinstance(axes, str):
+        axes = [axes]
+    return ",".join(str(a) for a in axes if a)
+
+
+def _confidence_cell(claim: dict[str, Any]) -> str:
+    return str(claim.get("confidence") or claim.get("certainty") or "")
+
+
+def _refs_cell(claim: dict[str, Any]) -> str:
+    refs = claim.get("source_refs") or claim.get("sources") or claim.get("source") or []
+    if isinstance(refs, str):
+        refs = [refs]
+    return _cell("; ".join(str(r) for r in refs[:4]), max_len=360)
+
+
+def _claim_value(claim: dict[str, Any]) -> str:
+    for key in ("claim", "value", "content", "description", "text"):
+        val = claim.get(key)
+        if val not in (None, ""):
+            return _cell(val, max_len=420)
+    return _cell(claim, max_len=420)
+
+
+def _append_claim_table(lines: list[str], title: str, claims: list[dict[str, Any]]) -> None:
+    lines.extend([f"## {title}", ""])
+    if not claims:
+        lines.extend(["| Status | Detail |", "|---|---|", "| Not captured | No product-specific claim found in this evidence axis. |", ""])
+        return
+    lines.extend([
+        "| # | Attribute | Claim / Value | Evidence axes | Confidence | Source refs / notes |",
+        "|---:|---|---|---|---|---|",
+    ])
+    for i, c in enumerate(claims, start=1):
+        attr = c.get("attribute") or c.get("heading") or c.get("claim_id") or c.get("type") or "claim"
+        notes = c.get("notes") or ""
+        refs = _refs_cell(c)
+        ref_notes = refs if refs else _cell(notes, max_len=360)
+        lines.append(
+            f"| {i} | {_cell(attr, max_len=120)} | {_claim_value(c)} | "
+            f"{_cell(_axes_cell(c), max_len=80)} | {_cell(_confidence_cell(c), max_len=80)} | {ref_notes} |"
+        )
+    lines.append("")
+
+def render_product_evidence_md(evidence: ProductEvidence) -> str:
+    """Render normalized evidence JSON into a business-readable markdown artifact.
+
+    This is intentionally table-first so stakeholders can inspect the artifact
+    quickly and downstream LLMs can parse sections deterministically.
+    """
+    data = evidence.model_dump()
+    lines: list[str] = [
+        "# Product Evidence Dossier",
+        "",
+        "This is the clean, product-only retailer evidence view. Navigation, footer, cookie text, ads, recommendations, and unrelated products are excluded.",
+        "",
+    ]
+
+    if evidence.product_focus_summary:
+        lines.extend(["## Executive product summary", "", evidence.product_focus_summary.strip(), ""])
+
+    lines.extend(["## Identity decision table", ""])
+    lines.extend(["| Field | Value | Evidence axes | Confidence | Source refs |", "|---|---|---|---|---|"])
     if evidence.product_identity:
         for key, value in evidence.product_identity.items():
             if isinstance(value, dict):
-                val = value.get("value", value)
-                axes = value.get("evidence_axis", [])
+                val = value.get("value", "")
+                axes = value.get("evidence_axis") or value.get("evidence_axes") or []
                 conf = value.get("confidence", "")
-                axes_txt = f"({','.join(str(a) for a in axes)})" if axes else ""
-                conf_txt = f"confidence={conf}" if conf else ""
-                lines.append(f"- **{key}**: {val or '(missing)'} {axes_txt} {conf_txt}".rstrip())
+                refs = value.get("source_refs") or []
+                lines.append(
+                    f"| {_cell(key, max_len=120)} | {_cell(val or '(missing)', max_len=260)} | "
+                    f"{_cell(','.join(str(a) for a in axes), max_len=80)} | {_cell(conf, max_len=80)} | "
+                    f"{_cell('; '.join(str(r) for r in refs[:4]), max_len=360)} |"
+                )
             else:
-                lines.append(f"- **{key}**: {value}")
-        lines.append("")
+                lines.append(f"| {_cell(key, max_len=120)} | {_cell(value, max_len=260)} |  |  |  |")
+    else:
+        lines.append("| Identity | Not captured |  | missing |  |")
+    lines.append("")
 
-    def _claims_section(title: str, claims: list[dict[str, Any]]) -> None:
-        lines.extend([f"## {title}", ""])
-        if not claims:
-            lines.extend(["- No claim captured.", ""])
-            return
-        for c in claims:
-            claim = c.get("claim") or c.get("value") or c.get("content") or json.dumps(c, ensure_ascii=False)
-            attr = c.get("attribute") or c.get("heading") or c.get("claim_id") or "claim"
-            axes = c.get("evidence_axis") or []
-            conf = c.get("confidence") or ""
-            refs = c.get("source_refs") or []
-            suffix = f" ({','.join(axes)})" if axes else ""
-            if conf:
-                suffix += f" confidence={conf}"
-            lines.append(f"- **{attr}**: {claim}{suffix}")
-            if refs:
-                lines.append(f"  - refs: {'; '.join(str(r) for r in refs[:5])}")
-        lines.append("")
+    _append_claim_table(lines, "Retailer claim decision table", data.get("retailer_claims", []))
+    _append_claim_table(lines, "Structured metadata decision table", data.get("structured_claims", []))
+    _append_claim_table(lines, "Table/specification decision table", data.get("table_claims", []))
+    _append_claim_table(lines, "Visual evidence decision table", data.get("visual_claims", []))
+    _append_claim_table(lines, "Upstream indexed/search/AI evidence table", data.get("upstream_indexed_claims", []))
 
-    _claims_section("Retailer product claims", data.get("retailer_claims", []))
-    _claims_section("Structured metadata claims", data.get("structured_claims", []))
-    _claims_section("Table/spec claims", data.get("table_claims", []))
-    _claims_section("Visual claims", data.get("visual_claims", []))
-    _claims_section("Upstream indexed/search/AI claims", data.get("upstream_indexed_claims", []))
-
-    lines += ["## Product-only text blocks", ""]
+    lines.extend(["## Product-only text evidence", ""])
     blocks = data.get("product_only_text_blocks") or []
     if not blocks:
-        lines += ["- No product-only text blocks captured.", ""]
+        lines.extend(["| Status | Detail |", "|---|---|", "| Not captured | No clean product-only text block was produced. |", ""])
     else:
-        for b in blocks:
+        lines.extend(["| # | Section | Evidence axes | Clean product text |", "|---:|---|---|---|"])
+        for i, b in enumerate(blocks, start=1):
             heading = b.get("heading") or "Product text"
             content = (b.get("content") or "").strip()
             axes = b.get("evidence_axis") or ["T"]
-            lines += [f"### {heading} ({','.join(axes)})", content or "(empty)", ""]
+            lines.append(
+                f"| {i} | {_cell(heading, max_len=160)} | {_cell(','.join(str(a) for a in axes), max_len=80)} | {_cell(content, max_len=700)} |"
+            )
+        lines.append("")
 
-    lines += ["## Discrepancies", ""]
+    lines.extend(["## Discrepancies", ""])
     discrepancies = data.get("discrepancies") or []
+    lines.extend(["| # | Discrepancy | Evidence / note |", "|---:|---|---|"])
     if discrepancies:
-        for d in discrepancies:
-            lines.append(f"- {json.dumps(d, ensure_ascii=False)}")
+        for i, d in enumerate(discrepancies, start=1):
+            if isinstance(d, dict):
+                lines.append(f"| {i} | {_cell(d.get('issue') or d.get('claim') or d, max_len=420)} | {_cell(d.get('evidence') or d.get('notes') or d, max_len=420)} |")
+            else:
+                lines.append(f"| {i} | {_cell(d, max_len=420)} |  |")
     else:
-        lines.append("- No discrepancy detected from supplied evidence.")
+        lines.append("| 1 | No discrepancy detected from supplied evidence. |  |")
     lines.append("")
 
-    lines += ["## Gaps", ""]
+    lines.extend(["## Gaps", ""])
     gaps = data.get("gaps") or []
+    lines.extend(["| # | Gap / missing evidence |", "|---:|---|"])
     if gaps:
-        for g in gaps:
-            lines.append(f"- {g}")
+        for i, g in enumerate(gaps, start=1):
+            lines.append(f"| {i} | {_cell(g, max_len=520)} |")
     else:
-        lines.append("- No explicit gap reported by the evidence normalizer.")
+        lines.append("| 1 | No explicit gap reported by the evidence normalizer. |")
     lines.append("")
 
-    lines += ["## Noise exclusion summary", ""]
     noise = data.get("noise_exclusion_summary") or {}
-    lines.append("```json")
-    lines.append(json.dumps(noise, ensure_ascii=False, indent=2))
-    lines.append("```")
+    lines.extend(["## Noise exclusion decision table", ""])
+    lines.extend(["| Category | Decision |", "|---|---|"])
+    excluded = noise.get("excluded_categories") or []
+    if excluded:
+        for cat in excluded:
+            lines.append(f"| {_cell(cat, max_len=160)} | Excluded from clean artifact |")
+    else:
+        lines.append("| Generic page noise | Excluded by product-only policy |")
+    if noise.get("notes"):
+        for note in noise.get("notes")[:6]:
+            lines.append(f"| Note | {_cell(note, max_len=420)} |")
     lines.append("")
 
-    lines += ["## Quality", ""]
-    lines.append("```json")
-    lines.append(json.dumps(data.get("quality") or {}, ensure_ascii=False, indent=2))
-    lines.append("```")
+    q = data.get("quality") or {}
+    lines.extend(["## Artifact quality summary", ""])
+    lines.extend(["| Metric | Value |", "|---|---|"])
+    for key in [
+        "access_status", "product_page_confidence", "evidence_completeness",
+        "has_text_evidence", "has_structured_evidence", "has_table_evidence",
+        "has_visual_evidence", "has_upstream_indexed_evidence", "browser_visible",
+        "product_details_recovered", "recovery_status", "created_by",
+    ]:
+        if key in q:
+            lines.append(f"| {_cell(key, max_len=160)} | {_cell(q.get(key), max_len=420)} |")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -729,12 +811,17 @@ def build_artifact_quality_report(
     }
 
 def synthesize_claims_md_from_evidence(evidence: ProductEvidence) -> str:
-    """Use LLM to turn normalized evidence JSON into the final claims.md."""
+    """Use LLM to turn normalized evidence JSON into the final business claims.md."""
     from .services.llm import get_llm_service
 
     user = (
         "Create claims.md from this normalized product-only evidence JSON. "
-        "Do not add new facts. Do not include navigation/footer/recommendations/noise.\n\n"
+        "Do not add new facts. Do not include navigation/footer/recommendations/noise. "
+        "The output must be business-readable and table-first. Use concise tables, not text-heavy prose. "
+        "Required sections: 1) Executive decision summary table, 2) Identity table, "
+        "3) Retailer claims table, 4) Visual evidence table, 5) Specifications/table evidence, "
+        "6) Gaps and discrepancies table, 7) Final downstream-readiness decision. "
+        "Every material row must include evidence axes and confidence.\n\n"
         f"```json\n{json.dumps(evidence.model_dump(), ensure_ascii=False, indent=2)}\n```"
     )
     resp = get_llm_service().predict(

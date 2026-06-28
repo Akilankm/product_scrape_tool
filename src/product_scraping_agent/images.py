@@ -2,8 +2,9 @@
 
 Behaviour:
 
-* Downloads each image at original quality into ``<out_dir>/images/`` (one
-  file per unique URL) so the user has the full resolution copies.
+* Downloads candidate images into ``<out_dir>/images/`` only after validating
+  that the response is a real raster image; final cleanup keeps only
+  vision-confirmed product images in that folder.
 * Builds a small JPEG thumbnail of each image and sends it to GPT-4o as
   base64 data-URL **bytes** (never as a text URL — image URLs are not
   transmitted to the model).
@@ -39,6 +40,9 @@ from .models import ImageRef
 
 # Cap: don't download huge originals (banner videos, posters etc.).
 _MAX_BYTES = 8_000_000
+_FINAL_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_IMAGE_RESPONSE_MIME_PREFIX = "image/"
+
 
 
 def _compute_phash(im: "Image.Image") -> str:
@@ -234,24 +238,63 @@ async def _download_one(
         return ref
 
     mime = (headers.get("content-type", "") or "").split(";")[0].strip().lower()
-    ext = IMAGE_MIME_EXT.get(mime, "")
     sha8 = hashlib.sha1(data).hexdigest()[:8]
+
+    # Final images/ must never contain HTML/error payloads, binary unknowns,
+    # SVG chrome, tracking pixels, or any file that Pillow cannot decode as a
+    # raster image. Keep such failures only in image_manifest.json.
+    if mime and not mime.startswith(_IMAGE_RESPONSE_MIME_PREFIX):
+        ref.error = f"non-image response mime={mime or 'unknown'} status={status_code}"
+        ref.bytes_size = len(data)
+        ref.mime = mime or ""
+        ref.sha8 = sha8
+        return ref
+    if mime == "image/svg+xml":
+        ref.error = "svg/vector image excluded from final product image set"
+        ref.bytes_size = len(data)
+        ref.mime = mime
+        ref.sha8 = sha8
+        return ref
 
     width = height = 0
     phash_hex = ""
-    if mime != "image/svg+xml":
+    ext = IMAGE_MIME_EXT.get(mime, "")
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+        with Image.open(io.BytesIO(data)) as im:
+            width, height = im.size
+            fmt = (im.format or "").lower()
+            if not ext and fmt:
+                ext = ".jpg" if fmt in {"jpeg", "jpg"} else f".{fmt}"
+            phash_hex = _compute_phash(im)
+    except Exception as exc:  # noqa: BLE001
+        ref.error = f"invalid image payload: {type(exc).__name__}"
+        ref.bytes_size = len(data)
+        ref.mime = mime or ""
+        ref.sha8 = sha8
+        return ref
+
+    ext = (ext or "").lower()
+    if ext == ".jpe":
+        ext = ".jpg"
+    if ext not in _FINAL_IMAGE_EXTS:
+        # Convert/normalize uncommon but valid raster formats into PNG rather
+        # than allowing .bin/.html/.avif/etc. into the clean artifact folder.
         try:
             with Image.open(io.BytesIO(data)) as im:
-                width, height = im.size
-                if not ext:
-                    ext = "." + (im.format or "png").lower()
-                phash_hex = _compute_phash(im)
-        except Exception:
-            pass
-    if not ext:
-        # fall back from URL path extension
-        m = re.search(r"\.([a-z0-9]{2,5})(?:\?|$)", url, re.IGNORECASE)
-        ext = ("." + m.group(1).lower()) if m else ".bin"
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, format="PNG")
+                data = buf.getvalue()
+                mime = "image/png"
+                ext = ".png"
+                sha8 = hashlib.sha1(data).hexdigest()[:8]
+        except Exception as exc:  # noqa: BLE001
+            ref.error = f"unsupported final image type ext={ext or 'unknown'} mime={mime or 'unknown'}: {type(exc).__name__}"
+            ref.bytes_size = len(data)
+            ref.mime = mime or ""
+            ref.sha8 = sha8
+            return ref
 
     fname = f"{idx:03d}_{sha8}{ext}"
     path = images_dir / fname
@@ -916,46 +959,79 @@ async def download_and_describe(
         n_described, len(picks), _time.monotonic() - t_v, vision_concurrency,
     )
 
-    # Belt-and-braces: even on rich describe survivors, honour any
-    # explicit ``RELATED: no`` the describe call surfaces (in case a
-    # closer look reveals it's actually a different product than the
-    # cheap pre-pass thought). Cheap to keep; never re-introduces files.
+    # Final cleanliness gate. The clean handoff contract is strict:
+    # ``images/`` contains only final vision-confirmed product images. Any
+    # downloaded candidate not selected for rich vision, not described, or
+    # explicitly judged unrelated is deleted from disk but retained in the
+    # manifest with an error/reason. This prevents .bin/.html/non-product
+    # leftovers and avoids noisy visual artifacts downstream.
     _REL_RE = re.compile(r"^\s*RELATED\s*:\s*(yes|no)\b", re.IGNORECASE)
-    n_dropped_late = 0
+    n_final_dropped = 0
+    n_final_kept = 0
     for r in refs:
-        if not r.description or r.local_path is None:
+        if r.local_path is None:
             continue
-        m = _REL_RE.match(r.description)
-        if m and m.group(1).lower() == "no":
-            try:
-                r.local_path.unlink()
-            except OSError:
-                pass
-            r.local_path = None
+        rel_match = _REL_RE.match(r.description or "")
+        rich_verdict = rel_match.group(1).lower() if rel_match else ""
+        keep = bool(r.description and rich_verdict == "yes")
+        if keep:
+            r.relevance = "yes"
+            n_final_kept += 1
+            continue
+        try:
+            r.local_path.unlink()
+        except OSError:
+            pass
+        r.local_path = None
+        if rich_verdict == "no":
             r.error = "unrelated to product (rich-describe verdict)"
-            r.description = ""
-            n_dropped_late += 1
-    if n_dropped_late:
+            r.relevance = "no"
+        elif not r.description:
+            r.error = "not vision-described; removed from clean images folder"
+        else:
+            r.error = "vision verdict missing/uncertain; removed from clean images folder"
+        r.description = "" if rich_verdict == "no" else r.description
+        n_final_dropped += 1
+    if n_final_dropped:
         logger.info(
-            "  relevance²  : dropped {} additional unrelated image(s)",
-            n_dropped_late,
+            "  final clean : kept {} vision-confirmed product image(s); removed {} candidate file(s)",
+            n_final_kept, n_final_dropped,
         )
 
-    # vision.md — human-readable summary of all per-image observations
-    vis_lines = ["# Visual observations (per image)\n"]
-    for i, r in enumerate(refs, start=1):
-        if not r.description:
-            continue
-        rel = r.local_path.relative_to(out_dir) if r.local_path else r.url
-        vis_lines.append(f"## Image {i:03d} — `{rel}`")
-        if r.alt:
-            vis_lines.append(f"_alt: {r.alt}_\n")
-        vis_lines.append(r.description)
-        vis_lines.append("")
-    if len(vis_lines) > 1:
-        (out_dir / "vision.md").write_text(
-            "\n".join(vis_lines), encoding="utf-8"
-        )
+    # vision.md — business-readable, table-first summary of retained images.
+    final_images = [r for r in refs if r.local_path is not None and r.description]
+    vis_lines = [
+        "# Visual Evidence Summary",
+        "",
+        "Only final vision-confirmed product images are listed. Candidate images removed during cleanup remain auditable in `manifests/image_manifest.json`.",
+        "",
+        "## Decision table",
+        "",
+        "| # | File | Decision | Visible product evidence | Alt text |",
+        "|---:|---|---|---|---|",
+    ]
+    for i, r in enumerate(final_images, start=1):
+        rel = r.local_path.relative_to(out_dir) if r.local_path else ""
+        desc = re.sub(r"^\s*RELATED\s*:\s*yes\s*", "", r.description or "", flags=re.I).strip()
+        desc = "<br>".join(
+            line.strip().lstrip("-•* ").replace("|", "\\|")
+            for line in desc.splitlines() if line.strip()
+        )[:900]
+        alt = (r.alt or "").replace("|", "\\|")[:180]
+        vis_lines.append(f"| {i} | `{rel}` | Keep — product/packaging evidence | {desc or '(description empty)'} | {alt} |")
+    if final_images:
+        vis_lines.extend([
+            "",
+            "## Image-level observations",
+            "",
+        ])
+        for i, r in enumerate(final_images, start=1):
+            rel = r.local_path.relative_to(out_dir) if r.local_path else r.url
+            vis_lines.append(f"### Image {i:03d} — `{rel}`")
+            vis_lines.append("")
+            vis_lines.append((r.description or "").strip())
+            vis_lines.append("")
+        (out_dir / "vision.md").write_text("\n".join(vis_lines).strip() + "\n", encoding="utf-8")
 
     return refs
 

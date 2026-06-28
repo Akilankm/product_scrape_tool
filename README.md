@@ -43,7 +43,7 @@ OUTPUT  : noise-free product evidence artifact folder
 
 The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
-## What changed in v1.1.5
+## What changed in v1.1.6
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
@@ -312,4 +312,25 @@ product_details_recovered
 recovery_status
 evidence_axes_used
 evidence_recovery_report.json
+```
+
+## v1.1.6 clean image and Markdown contract
+
+The final `retailer/images/` folder is now strict: it contains only final raster product images that passed rich vision validation with `RELATED: yes`.
+
+Rejected candidates are not silently lost. They are audited in:
+
+```text
+retailer/manifests/image_manifest.json
+```
+
+This means `.bin`, `.html`, CDN error bodies, SVG chrome, unsupported payloads, and unverified/non-product candidates should not remain in the final `images/` folder.
+
+Markdown handoff files are also more business-readable and table-first:
+
+```text
+source.md              # product-only extracted text table
+vision.md              # retained image decision table + observations
+product_evidence.md    # identity/claims/spec/visual/gap tables
+claims.md              # business-level decision dossier
 ```
