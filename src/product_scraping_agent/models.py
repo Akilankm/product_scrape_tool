@@ -437,6 +437,10 @@ class ScrapeResult(BaseModel):
     final_image_count: int = 0
     image_downloaded_count: int = 0
     vision_described_count: int = 0
+    image_required: bool = True
+    screenshot_fallback_used: bool = False
+    visual_evidence_status: str = "not_evaluated"
+    image_failure_reason: str = ""
     table_count: int = 0
     json_ld_count: int = 0
     agent_iterations: int = 0
@@ -591,6 +595,10 @@ class ScrapedProduct(BaseModel):
     claims_markdown: str = ""
     images: list[ImageRef] = Field(default_factory=list)
     tables: list[TableRef] = Field(default_factory=list)
+    image_required: bool = True
+    screenshot_fallback_used: bool = False
+    visual_evidence_status: str = "not_evaluated"
+    image_failure_reason: str = ""
 
     request_json_path: Path | None = None
     scrape_result_json_path: Path | None = None
@@ -667,10 +675,14 @@ class ScrapedProduct(BaseModel):
             agent_trace_json_path=self.agent_trace_json_path,
             raw_debug_dir=self.raw_debug_dir,
             image_candidate_count=len(self.images),
-            image_count=sum(1 for img in self.images if img.local_path and img.description and str(img.relevance).lower() == "yes"),
-            final_image_count=sum(1 for img in self.images if img.local_path and img.description and str(img.relevance).lower() == "yes"),
+            image_count=sum(1 for img in self.images if img.local_path),
+            final_image_count=sum(1 for img in self.images if img.local_path),
             image_downloaded_count=sum(1 for img in self.images if img.local_path),
             vision_described_count=sum(1 for img in self.images if img.local_path and img.description),
+            image_required=self.image_required,
+            screenshot_fallback_used=self.screenshot_fallback_used,
+            visual_evidence_status=self.visual_evidence_status,
+            image_failure_reason=self.image_failure_reason,
             table_count=len(self.tables),
             json_ld_count=len(self.json_ld),
             agent_iterations=self.agent_iterations,

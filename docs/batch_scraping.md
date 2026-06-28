@@ -167,3 +167,16 @@ pdm run scrape-batch \
   --output-csv data/output.csv \
   --disable-domain-profile-learning
 ```
+
+## v1.2.5 batch image columns
+
+The batch output CSV includes visual evidence columns:
+
+```text
+image_required
+screenshot_fallback_used
+visual_evidence_status
+image_failure_reason
+```
+
+Filter `visual_evidence_status != final_product_images_available` to find products that are not ready for downstream automated coding.

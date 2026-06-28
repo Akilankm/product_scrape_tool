@@ -492,3 +492,23 @@ Key output columns:
 | `evidence_recovery_report_path` | Browser/URL/input/upstream evidence recovery audit. |
 
 See `docs/batch_scraping.md` for the full contract.
+
+## v1.2.5 visual-evidence and worker-finalization contract
+
+Product images are mandatory for downstream product identification. From v1.2.5:
+
+- every batch worker finalizes its row with `_COMPLETE.json` or `_FAILED.json`;
+- `vision.md` is never empty;
+- batch output includes `visual_evidence_status`, `image_required`, `screenshot_fallback_used`, and `image_failure_reason`;
+- `artifact_quality=usable/strong` requires at least one clean downloaded product image;
+- screenshot fallback is retained only as manual-review rescue evidence.
+
+Expected visual statuses:
+
+| Status | Meaning |
+|---|---|
+| `final_product_images_available` | Clean product image retained. |
+| `unverified_images_retained` | Image retained but not cleanly vision-confirmed. |
+| `screenshot_fallback_only` | Screenshot fallback retained; manual review required. |
+| `image_recovery_failed` | No usable image retained. |
+| `no_image_candidates` | No image candidates discovered. |

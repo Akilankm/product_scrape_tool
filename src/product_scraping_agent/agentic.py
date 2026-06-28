@@ -958,7 +958,16 @@ def build_artifact_quality_report(
     )
     product_text_chars = sum(len(str((b or {}).get("content", ""))) for b in (evidence.product_only_text_blocks or []))
     downloaded_images = [img for img in images if img.local_path]
-    described_images = [img for img in images if img.description]
+    described_images = [img for img in images if img.local_path and img.description]
+    clean_product_images = [img for img in images if img.local_path and str(img.relevance).lower() == "yes" and getattr(img, "download_source", "") != "screenshot_fallback"]
+    screenshot_fallback_images = [img for img in images if img.local_path and getattr(img, "download_source", "") == "screenshot_fallback"]
+    visual_evidence_status = getattr(result, "visual_evidence_status", "") or (
+        "final_product_images_available" if clean_product_images else
+        "screenshot_fallback_only" if screenshot_fallback_images else
+        "unverified_images_retained" if downloaded_images else
+        "image_recovery_failed" if images else
+        "no_image_candidates"
+    )
     download_403 = [img for img in images if "403" in (img.error or "")]
     download_errors = [img for img in images if img.error]
     axes = evidence_axes_from_product_evidence(evidence)
@@ -976,7 +985,9 @@ def build_artifact_quality_report(
         ),
         "has_retailer_url": bool(result.final_url or page.final_url or page.url),
         "has_product_text": bool(product_text_chars >= 80 or evidence.retailer_claims or page.raw_markdown),
-        "has_visual_evidence": bool(described_images),
+        "has_visual_evidence": bool(clean_product_images),
+        "has_any_visual_file": bool(downloaded_images),
+        "has_screenshot_fallback": bool(screenshot_fallback_images),
         "has_table_or_structured_evidence": bool(tables or page.json_ld or page.og or page.product_meta or evidence.structured_claims or evidence.table_claims),
         "has_evidence_axes": bool(axes),
         "has_gap_reporting": isinstance(evidence.gaps, list),
@@ -993,6 +1004,8 @@ def build_artifact_quality_report(
         missing.append("brand_or_manufacturer_signal")
     if not checks["has_retailer_url"]:
         missing.append("retailer_url")
+    if getattr(result, "image_required", True) and not checks["has_visual_evidence"]:
+        missing.append("visual_product_image")
     if not checks["has_product_text"] and not checks["has_table_or_structured_evidence"] and not checks["has_visual_evidence"]:
         missing.append("product_evidence_content")
     if not checks["has_evidence_axes"]:
@@ -1005,6 +1018,10 @@ def build_artifact_quality_report(
         warnings.append(f"{len(download_403)} image candidate(s) failed with HTTP 403; CDN recovery may be partial")
     if download_errors and len(downloaded_images) < max(3, len(images) // 4):
         warnings.append("image download success rate is low")
+    if not clean_product_images:
+        warnings.append("no clean downloaded product image retained; visual evidence is mandatory for usable product identification")
+    if screenshot_fallback_images:
+        warnings.append("screenshot fallback used; this is not a clean product-gallery image and requires manual review")
     if not described_images:
         warnings.append("no vision-described product image retained")
     if not tables and not page.json_ld:
@@ -1032,7 +1049,9 @@ def build_artifact_quality_report(
     score += 10 if checks["has_retailer_url"] else 0
     score += 15 if checks["has_product_text"] else 0
     score += 10 if checks["has_table_or_structured_evidence"] else 0
-    score += 10 if checks["has_visual_evidence"] else 0
+    score += 15 if checks["has_visual_evidence"] else 0
+    if checks.get("has_screenshot_fallback"):
+        score += 4
     score += 10 if checks["has_evidence_axes"] else 0
     score += 5 if checks["source_alignment_documented"] else 0
     if claims_count >= 5:
@@ -1053,9 +1072,17 @@ def build_artifact_quality_report(
         score -= 10
     if getattr(result, "capture_decision", "") in {"input_url_only_artifact", "fetch_failed_input_url_only_artifact", "blocked_or_challenge_capture"}:
         score -= 15
+    if getattr(result, "image_required", True) and not checks["has_visual_evidence"]:
+        score -= 30
+        if checks.get("has_screenshot_fallback"):
+            score += 10
     score = max(0, min(100, score))
 
-    if missing:
+    if getattr(result, "image_required", True) and not checks["has_visual_evidence"] and not checks.get("has_screenshot_fallback"):
+        artifact_quality = "insufficient"
+    elif getattr(result, "image_required", True) and checks.get("has_screenshot_fallback") and not checks["has_visual_evidence"]:
+        artifact_quality = "partial"
+    elif missing:
         artifact_quality = "partial" if score >= 45 else "insufficient"
     elif not getattr(result, "real_scrape_evidence", False):
         artifact_quality = "partial" if score >= 55 else "insufficient"
@@ -1073,6 +1100,10 @@ def build_artifact_quality_report(
     recommended_followups: list[str] = []
     if "product_name_or_title" in missing or "product_evidence_content" in missing:
         recommended_followups.append("rerun with max_agent_iterations>=3 and write_raw_debug=true for audit")
+    if not clean_product_images:
+        recommended_followups.append("fix image recovery: product images are mandatory; check CDN headers, referer/cookies, browser-context image download, and proxy/session configuration")
+    if screenshot_fallback_images:
+        recommended_followups.append("use screenshot fallback only for review; rerun once clean gallery-image download is fixed")
     if not described_images:
         recommended_followups.append("check PCA_LLM_VISION_ENABLED and gateway vision permissions")
     if download_403:
@@ -1101,13 +1132,25 @@ def build_artifact_quality_report(
             "product_only_text_blocks": len(evidence.product_only_text_blocks or []),
             "product_only_text_chars": product_text_chars,
             "downloaded_images": len(downloaded_images),
+            "clean_product_images": len(clean_product_images),
+            "screenshot_fallback_images": len(screenshot_fallback_images),
             "vision_described_images": len(described_images),
+            "visual_evidence_status": visual_evidence_status,
             "image_download_errors": len(download_errors),
             "image_http_403_errors": len(download_403),
             "tables": len(tables),
             "json_ld_blocks": len(page.json_ld or []),
         },
         "source_alignment": source_alignment.model_report(),
+        "visual_evidence": {
+            "image_required": getattr(result, "image_required", True),
+            "visual_evidence_status": visual_evidence_status,
+            "image_failure_reason": getattr(result, "image_failure_reason", ""),
+            "final_image_count": len(downloaded_images),
+            "clean_product_image_count": len(clean_product_images),
+            "screenshot_fallback_used": bool(screenshot_fallback_images),
+            "policy": "Clean downloaded product image is mandatory for usable artifact; screenshot fallback is partial/manual-review evidence only.",
+        },
         "capture": {
             "capture_profile_used": getattr(result, "capture_profile_used", ""),
             "capture_profiles_attempted": getattr(result, "capture_profiles_attempted", []),

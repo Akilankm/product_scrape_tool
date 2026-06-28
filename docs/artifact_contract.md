@@ -220,3 +220,9 @@ usable       = sufficient evidence with minor warnings
 partial      = usable only with review or supplemental evidence
 insufficient = do not code automatically; evidence is too weak
 ```
+
+## v1.2.5 mandatory visual evidence
+
+For product identification, `retailer/images/` must contain at least one retained image file for the artifact to be considered usable. If clean gallery image recovery fails, the scraper may write `images/screenshot_fallback.png`, but this is marked as `screenshot_fallback_only` and requires manual review.
+
+`vision.md` must always contain a visual evidence decision table, even when no image could be recovered.

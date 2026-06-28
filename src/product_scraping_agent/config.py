@@ -83,6 +83,10 @@ class Config:
     image_download_timeout: float = _env_float("IMAGE_DOWNLOAD_TIMEOUT", 20.0)
     image_retry_strategies_enabled: bool = _env_bool("IMAGE_RETRY_STRATEGIES_ENABLED", True)
     image_retry_strip_query: bool = _env_bool("IMAGE_RETRY_STRIP_QUERY", False)
+    image_required: bool = _env_bool("IMAGE_REQUIRED", True)
+    screenshot_fallback_enabled: bool = _env_bool("SCREENSHOT_FALLBACK_ENABLED", True)
+    screenshot_timeout: float = _env_float("SCREENSHOT_TIMEOUT", 25.0)
+    screenshot_full_page: bool = _env_bool("SCREENSHOT_FULL_PAGE", False)
 
     # Azure OpenAI / compatible gateway.
     llm_api_key: str = _env("LLM_API_KEY", "")

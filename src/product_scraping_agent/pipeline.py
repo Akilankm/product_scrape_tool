@@ -35,9 +35,9 @@ from .agentic import (
 )
 from .config import Config, get_config
 from .full_scraper import FullPage, fetch_full, fetch_best_full, merge_full_pages, table_html_to_markdown
-from .images import download_and_describe
+from .images import download_and_describe, capture_screenshot_fallback
 from .log import logger
-from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapedProduct, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
+from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapeRequest, ScrapedProduct, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
 from .text_utils import truncate_text
 
 _MAX_TABLES = 40
@@ -76,7 +76,9 @@ def output_dir_for(
 
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -93,7 +95,9 @@ def _to_jsonable(value: Any) -> Any:
 
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_to_jsonable(data), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(_to_jsonable(data), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _safe_rel(path: Path | None, base: Path) -> str:
@@ -206,6 +210,110 @@ def _image_manifest(images: list[ImageRef], out_dir: Path) -> list[dict[str, Any
     return rows
 
 
+def _final_image_refs(images: list[ImageRef]) -> list[ImageRef]:
+    """Images retained under retailer/images/ as visual evidence.
+
+    Clean gallery images have relevance=yes. Screenshot fallback and degraded
+    unverified retained images are also files the downstream vision agent can
+    inspect, but they are not considered clean product-gallery images.
+    """
+    return [img for img in images if img.local_path is not None]
+
+
+def _clean_product_image_refs(images: list[ImageRef]) -> list[ImageRef]:
+    return [
+        img for img in images
+        if img.local_path is not None
+        and str(img.relevance).lower() == "yes"
+        and img.download_source != "screenshot_fallback"
+    ]
+
+
+def _visual_evidence_decision(images: list[ImageRef], *, image_required: bool = True) -> dict[str, Any]:
+    candidates = len(images)
+    downloaded = sum(1 for img in images if img.local_path is not None)
+    clean_product = len(_clean_product_image_refs(images))
+    screenshot = any(img.local_path is not None and img.download_source == "screenshot_fallback" for img in images)
+    described = sum(1 for img in images if img.local_path is not None and img.description)
+    failed = [img for img in images if img.error]
+    if clean_product >= 1:
+        status = "final_product_images_available"
+        reason = "at least one clean product image was downloaded and retained"
+    elif screenshot:
+        status = "screenshot_fallback_only"
+        reason = "clean product image download/validation failed; page screenshot fallback retained"
+    elif downloaded >= 1:
+        status = "unverified_images_retained"
+        reason = "image files were retained but not vision-confirmed as product images"
+    elif candidates > 0:
+        status = "image_recovery_failed"
+        reason = "image candidates were found but no usable image file was retained"
+    else:
+        status = "no_image_candidates"
+        reason = "no image candidates were discovered on the captured page"
+    return {
+        "image_required": bool(image_required),
+        "visual_evidence_status": status,
+        "image_failure_reason": "" if status == "final_product_images_available" else reason,
+        "image_candidate_count": candidates,
+        "image_downloaded_count": downloaded,
+        "final_image_count": downloaded,
+        "clean_product_image_count": clean_product,
+        "vision_described_count": described,
+        "screenshot_fallback_used": screenshot,
+        "image_download_errors": len(failed),
+        "image_error_examples": [str(img.error)[:220] for img in failed[:5] if img.error],
+        "policy": "A clean downloaded product image is mandatory for a usable artifact. Screenshot fallback is visual rescue only and requires manual review.",
+    }
+
+
+def _write_visual_evidence_md(path: Path, *, out_dir: Path, images: list[ImageRef], decision: dict[str, Any]) -> None:
+    lines = [
+        "# Visual Evidence Summary",
+        "",
+        "Product image evidence is mandatory for downstream product identification.",
+        "",
+        "## Visual evidence decision",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Image required | {decision.get('image_required')} |",
+        f"| Visual evidence status | {decision.get('visual_evidence_status')} |",
+        f"| Image failure reason | {_md_cell(decision.get('image_failure_reason') or '-', max_len=500)} |",
+        f"| Image candidates found | {decision.get('image_candidate_count', 0)} |",
+        f"| Images retained in images/ | {decision.get('image_downloaded_count', 0)} |",
+        f"| Clean product-gallery images | {decision.get('clean_product_image_count', 0)} |",
+        f"| Vision-described images | {decision.get('vision_described_count', 0)} |",
+        f"| Screenshot fallback used | {decision.get('screenshot_fallback_used')} |",
+        f"| Image download/recovery errors | {decision.get('image_download_errors', 0)} |",
+        "",
+        "## Retained visual files",
+        "",
+        "| # | File | Evidence type | Relevance | Description / review note | Source URL |",
+        "|---:|---|---|---|---|---|",
+    ]
+    retained = _final_image_refs(images)
+    if not retained:
+        lines.append("| 0 | - | none | failed | No image file was retained. See `manifests/image_manifest.json` for candidate-level failures. | - |")
+    else:
+        for i, img in enumerate(retained, start=1):
+            try:
+                rel_path = img.local_path.relative_to(out_dir) if img.local_path else ""
+            except Exception:
+                rel_path = img.local_path or ""
+            evidence_type = "screenshot_fallback" if img.download_source == "screenshot_fallback" else "product_image_candidate"
+            desc = re.sub(r"^\s*RELATED\s*:\s*[^\n]+", "", img.description or "", flags=re.I).strip()
+            desc = "<br>".join(line.strip().lstrip("-•* ").replace("|", "\\|") for line in desc.splitlines() if line.strip())[:900]
+            if not desc:
+                desc = img.error or "image retained; rich vision description unavailable"
+            lines.append(f"| {i} | `{rel_path}` | {evidence_type} | {_md_cell(img.relevance or '-', max_len=80)} | {_md_cell(desc, max_len=900)} | {_md_cell(img.url, max_len=120)} |")
+    if decision.get("image_error_examples"):
+        lines.extend(["", "## Image recovery error examples", "", "| # | Error |", "|---:|---|"])
+        for i, err in enumerate(decision.get("image_error_examples") or [], start=1):
+            lines.append(f"| {i} | {_md_cell(err, max_len=300)} |")
+    _write_text(path, "\n".join(lines).strip() + "\n")
+
+
 def _table_manifest(tables: list[TableRef], out_dir: Path) -> list[dict[str, Any]]:
     return [
         {
@@ -284,9 +392,12 @@ def _artifact_manifest(
         },
         "counts": {
             "image_candidates": len(images),
-            "final_images": sum(1 for i in images if i.local_path and i.description and str(i.relevance).lower() == "yes"),
+            "final_images": sum(1 for i in images if i.local_path),
+            "clean_product_images": len(_clean_product_image_refs(images)),
             "images_downloaded": sum(1 for i in images if i.local_path),
             "images_described": sum(1 for i in images if i.local_path and i.description),
+            "screenshot_fallback_used": any(i.local_path and i.download_source == "screenshot_fallback" for i in images),
+            "visual_evidence_status": result.visual_evidence_status,
             "image_download_errors": sum(1 for i in images if i.error),
             "image_cdn_403_errors": sum(1 for i in images if "403" in (i.error or "")),
             "tables": len(tables),
@@ -305,7 +416,12 @@ def _artifact_manifest(
             "has_url_derived_evidence": bool(result.url),
             "has_text_evidence": bool(result.raw_markdown),
             "has_structured_data": bool(result.json_ld),
-            "has_visual_evidence": any(i.local_path and i.description and str(i.relevance).lower() == "yes" for i in images),
+            "has_visual_evidence": bool(_clean_product_image_refs(images)),
+            "has_any_visual_file": any(i.local_path for i in images),
+            "image_required": result.image_required,
+            "visual_evidence_status": result.visual_evidence_status,
+            "image_failure_reason": result.image_failure_reason,
+            "screenshot_fallback_used": result.screenshot_fallback_used,
             "has_table_evidence": bool(tables),
             "has_product_evidence_json": bool(evidence),
             "has_claims_synthesis": bool(result.claims_markdown),
@@ -676,6 +792,11 @@ async def scrape_product(
         artifact_manifest_path=artifact_manifest_path,
     )
 
+    in_progress_path = scrape_root / "_IN_PROGRESS.json"
+    complete_path = scrape_root / "_COMPLETE.json"
+    failed_path = scrape_root / "_FAILED.json"
+
+    _write_json(in_progress_path, {"scrape_id": sid, "status": "in_progress", "started_at": started.isoformat(), "product_url": url})
     _write_json(request_path, {
         "scrape_id": sid,
         "product_url": url,
@@ -788,8 +909,16 @@ async def scrape_product(
     if (not page.success or not (page.raw_markdown or page.raw_html)) and not recoverable_evidence_present:
         result.error = page.error or page.access_issue_reason or "empty page and no recoverable evidence"
         result.elapsed_seconds = datetime.now(timezone.utc).timestamp() - t0
+        result.image_required = cfg.image_required
+        result.visual_evidence_status = "image_recovery_failed"
+        result.image_failure_reason = "no recoverable page evidence and no product image recovered"
         _write_json(image_manifest_path, [])
         _write_json(table_manifest_path, [])
+        _write_visual_evidence_md(vision_path, out_dir=out_dir, images=[], decision=_visual_evidence_decision([], image_required=cfg.image_required))
+        _write_text(source_path, "# Source Artifact\n\n| Field | Value |\n|---|---|\n| Status | No recoverable evidence |\n| Product URL | " + url + " |\n| Access status | " + result.access_status + " |\n")
+        _write_json(product_evidence_json_path, {"quality_gate": {"artifact_quality": "insufficient"}, "gaps": ["no recoverable page evidence", "no product image recovered"], "source_alignment": source_alignment.model_report()})
+        _write_text(product_evidence_md_path, "# Product Evidence\n\n| Field | Value |\n|---|---|\n| Artifact quality | insufficient |\n| Visual evidence | image_recovery_failed |\n")
+        _write_text(claims_path, "# Claims\n\nNo claims were synthesized because no recoverable product evidence was captured.\n")
         empty_recovery = build_evidence_recovery_report(
             result=result,
             evidence=None,
@@ -827,6 +956,11 @@ async def scrape_product(
             quality_report=empty_quality_report,
         ))
         _write_json(result_path, result.to_scrape_result().model_dump())
+        _write_json(failed_path, {"scrape_id": sid, "status": "failed", "failed_at": datetime.now(timezone.utc).isoformat(), "error": result.error, "visual_evidence_status": result.visual_evidence_status})
+        try:
+            in_progress_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         logger.error("  ✗ no recoverable evidence: {}", result.error)
         return result
     if not page.success or not (page.raw_markdown or page.raw_html):
@@ -859,11 +993,43 @@ async def scrape_product(
             )
         except Exception as exc:
             logger.exception("  ✗ image stage failed: {}", exc)
+    # If clean/retained image recovery failed, attempt a screenshot fallback so
+    # every completed product artifact has some visual evidence whenever possible.
+    initial_visual = _visual_evidence_decision(refs, image_required=cfg.image_required)
+    if (
+        cfg.image_required
+        and cfg.screenshot_fallback_enabled
+        and initial_visual.get("image_downloaded_count", 0) == 0
+    ):
+        logger.warning(
+            "  image rescue: no retained image files; attempting screenshot fallback"
+        )
+        shot = await capture_screenshot_fallback(
+            page_url=result.final_url or url,
+            out_dir=out_dir,
+            product_hint=resolved_hint,
+            timeout=cfg.screenshot_timeout,
+            full_page=cfg.screenshot_full_page,
+        )
+        refs.append(shot)
+        if shot.local_path:
+            logger.warning("  image rescue: screenshot fallback retained at {}", shot.local_path)
+        else:
+            logger.warning("  image rescue: screenshot fallback failed: {}", shot.error)
+
     result.images = refs
+    visual_decision = _visual_evidence_decision(refs, image_required=cfg.image_required)
+    result.image_required = bool(visual_decision.get("image_required", True))
+    result.screenshot_fallback_used = bool(visual_decision.get("screenshot_fallback_used", False))
+    result.visual_evidence_status = str(visual_decision.get("visual_evidence_status") or "not_evaluated")
+    result.image_failure_reason = str(visual_decision.get("image_failure_reason") or "")
     _write_json(image_manifest_path, _image_manifest(refs, out_dir))
-    logger.info("  ✓ images: {} downloaded, {} vision-described in {:.2f}s",
+    # Write a non-empty vision.md checkpoint immediately after image recovery.
+    _write_visual_evidence_md(vision_path, out_dir=out_dir, images=refs, decision=visual_decision)
+    logger.info("  ✓ images: {} retained, {} vision-described status={} in {:.2f}s",
                 sum(1 for r in refs if r.local_path),
-                sum(1 for r in refs if r.description),
+                sum(1 for r in refs if r.local_path and r.description),
+                result.visual_evidence_status,
                 time.monotonic() - t_step)
 
     # Step 4: Product-only evidence normalization.
@@ -921,6 +1087,12 @@ async def scrape_product(
     evidence.quality.setdefault("real_scrape_evidence", result.real_scrape_evidence)
     evidence.quality.setdefault("capture_decision", result.capture_decision)
     evidence.quality.setdefault("weak_capture_reasons", result.weak_capture_reasons)
+    evidence.quality.setdefault("image_required", result.image_required)
+    evidence.quality.setdefault("visual_evidence_status", result.visual_evidence_status)
+    evidence.quality.setdefault("image_failure_reason", result.image_failure_reason)
+    evidence.quality.setdefault("screenshot_fallback_used", result.screenshot_fallback_used)
+    evidence.quality.setdefault("final_image_count", sum(1 for r in refs if r.local_path))
+    evidence.quality.setdefault("clean_product_image_count", len(_clean_product_image_refs(refs)))
     result.evidence_axes_used = evidence_axes_from_product_evidence(evidence)
     result.product_details_recovered = deterministic_product_details_recovered(evidence)
     recovery_report = build_evidence_recovery_report(
@@ -946,26 +1118,17 @@ async def scrape_product(
     logger.info("  ✓ product_evidence.md ({:,} chars)", len(evidence_md))
     logger.info("  ✓ source.md product-only ({:,} chars) in {:.2f}s", len(source_md), time.monotonic() - t_step)
 
-    # Step 5: Vision markdown after evidence normalization so only retained images are described.
+    # Step 5: Vision markdown after evidence normalization. Never emit an empty
+    # file; if image recovery failed, record the exact visual-evidence status.
     logger.info("")
     logger.info("── STEP 5/7: VISION.MD ──")
-    vision_lines = ["# Product image observations", "", "Only product-relevant images retained by the relevance gate are represented here.", ""]
-    for i, img in enumerate(refs, start=1):
-        if not img.local_path or not img.description:
-            continue
-        vision_lines.extend([
-            f"## Image {i:03d} — `{img.local_path.name}`",
-            f"- source_url: {img.url}",
-            f"- alt: {img.alt or '(none)'}",
-            f"- relevance: {img.relevance or 'unverified'}",
-            "",
-            img.description.strip(),
-            "",
-        ])
-    if len(vision_lines) <= 4:
-        vision_lines.append("No product image observations were available.")
-    _write_text(vision_path, "\n".join(vision_lines).strip() + "\n")
-    logger.info("  ✓ vision.md")
+    visual_decision = _visual_evidence_decision(refs, image_required=cfg.image_required)
+    result.image_required = bool(visual_decision.get("image_required", True))
+    result.screenshot_fallback_used = bool(visual_decision.get("screenshot_fallback_used", False))
+    result.visual_evidence_status = str(visual_decision.get("visual_evidence_status") or "not_evaluated")
+    result.image_failure_reason = str(visual_decision.get("image_failure_reason") or "")
+    _write_visual_evidence_md(vision_path, out_dir=out_dir, images=refs, decision=visual_decision)
+    logger.info("  ✓ vision.md status={} retained_images={}", result.visual_evidence_status, visual_decision.get("image_downloaded_count", 0))
 
     # Step 6: Claims synthesis from normalized evidence only.
     logger.info("")
@@ -1034,9 +1197,136 @@ async def scrape_product(
     ))
     _write_json(result_path, result.to_scrape_result().model_dump())
     logger.info("  ✓ artifact_manifest.json")
+    _write_json(complete_path, {"scrape_id": sid, "status": "complete", "completed_at": datetime.now(timezone.utc).isoformat(), "artifact_quality": result.to_scrape_result().artifact_quality, "visual_evidence_status": result.visual_evidence_status})
+    try:
+        in_progress_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     logger.info("  ✓ scrape_result.json")
     logger.info("  complete  : scrape_id={} elapsed={:.1f}s", sid, result.elapsed_seconds)
     return result
 
 
-__all__ = ["make_scrape_id", "scrape_product", "slug_from_url", "output_dir_for"]
+def write_failed_artifact_for_request(
+    request: ScrapeRequest,
+    *,
+    error: str,
+    config: Config | None = None,
+    output_root: Path | None = None,
+) -> ScrapedProduct:
+    """Write a complete failure/partial artifact for a row-level exception.
+
+    Batch workers must never leave only `request.json` and `manifests/` behind.
+    This helper finalizes the row contract even when Crawl4AI, image recovery,
+    LLM normalization, or any unexpected stage raises before normal Step 7.
+    """
+    cfg = config or get_config()
+    sid = (request.scrape_id or make_scrape_id()).strip()
+    out_root = output_root or request.output_root or cfg.output_root
+    out_dir = output_dir_for(sid, request.product_url, output_root=out_root, retailer_label=request.retailer_label or "retailer")
+    scrape_root = out_dir.parent
+    manifests_dir = out_dir / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+
+    request_path = scrape_root / "request.json"
+    result_path = scrape_root / "scrape_result.json"
+    source_path = out_dir / "source.md"
+    product_evidence_md_path = out_dir / "product_evidence.md"
+    product_evidence_json_path = out_dir / "product_evidence.json"
+    claims_path = out_dir / "claims.md"
+    vision_path = out_dir / "vision.md"
+    metadata_path = out_dir / "metadata.json"
+    noise_report_path = out_dir / "noise_report.json"
+    evidence_recovery_report_path = out_dir / "evidence_recovery_report.json"
+    quality_report_path = out_dir / "quality_report.json"
+    source_alignment_report_path = out_dir / "source_alignment_report.json"
+    agent_trace_path = manifests_dir / "agent_trace.json"
+    image_manifest_path = manifests_dir / "image_manifest.json"
+    table_manifest_path = manifests_dir / "table_manifest.json"
+    artifact_manifest_path = manifests_dir / "artifact_manifest.json"
+
+    input_context = request.input_context
+    source_alignment = request.source_alignment
+    result = ScrapedProduct(
+        scrape_id=sid,
+        url=request.product_url,
+        final_url=request.product_url,
+        output_dir=out_dir,
+        input_context=input_context,
+        source_alignment=source_alignment,
+        upstream_evidence=request.upstream_evidence,
+        request_json_path=request_path,
+        scrape_result_json_path=result_path,
+        source_md_path=source_path,
+        product_evidence_md_path=product_evidence_md_path,
+        product_evidence_json_path=product_evidence_json_path,
+        claims_md_path=claims_path,
+        vision_md_path=vision_path,
+        metadata_json_path=metadata_path,
+        noise_report_json_path=noise_report_path,
+        evidence_recovery_report_json_path=evidence_recovery_report_path,
+        quality_report_json_path=quality_report_path,
+        source_alignment_report_json_path=source_alignment_report_path,
+        agent_trace_json_path=agent_trace_path,
+        image_manifest_path=image_manifest_path,
+        table_manifest_path=table_manifest_path,
+        artifact_manifest_path=artifact_manifest_path,
+        access_status="fetch_error",
+        access_issue_type="worker_exception",
+        access_issue_reason=error,
+        capture_grade="failed",
+        capture_decision="worker_failed_finalized_artifact",
+        real_scrape_evidence=False,
+        image_required=True,
+        visual_evidence_status="image_recovery_failed",
+        image_failure_reason="row failed before product image recovery could complete",
+        error=error,
+    )
+    quality_report = {
+        "artifact_quality": "insufficient",
+        "quality_score": 0,
+        "requires_manual_review": True,
+        "missing_critical_fields": ["visual_product_image", "product_evidence_content"],
+        "warnings": ["worker exception occurred; failure artifact finalized", "no clean product image retained"],
+        "visual_evidence": {
+            "image_required": True,
+            "visual_evidence_status": result.visual_evidence_status,
+            "image_failure_reason": result.image_failure_reason,
+            "final_image_count": 0,
+            "clean_product_image_count": 0,
+            "screenshot_fallback_used": False,
+        },
+        "reason": error,
+    }
+    result.product_evidence = {
+        "quality_gate": quality_report,
+        "product_identity": {"input_main_text": input_context.main_text, "input_ean": input_context.ean},
+        "gaps": ["Worker exception prevented normal artifact creation", "No product image was recovered"],
+        "source_alignment": source_alignment.model_report(),
+    }
+    _write_json(scrape_root / "_FAILED.json", {"scrape_id": sid, "status": "failed", "failed_at": datetime.now(timezone.utc).isoformat(), "error": error, "visual_evidence_status": result.visual_evidence_status})
+    try:
+        (scrape_root / "_IN_PROGRESS.json").unlink(missing_ok=True)
+    except Exception:
+        pass
+    _write_json(request_path, request.model_dump())
+    _write_json(metadata_path, {"scrape_id": sid, "product_url": request.product_url, "error": error, "finalized_failure_artifact": True})
+    _write_json(source_alignment_report_path, _build_source_alignment_report(source_alignment=source_alignment, final_url=request.product_url, page_title=""))
+    _write_json(agent_trace_path, [{"stage": "worker_exception", "error": error}])
+    _write_json(image_manifest_path, [])
+    _write_json(table_manifest_path, [])
+    _write_json(noise_report_path, {"raw_noise_text_persisted": False, "error": error})
+    _write_json(evidence_recovery_report_path, {"recovery_status": "failed", "error": error, "visual_evidence_status": result.visual_evidence_status})
+    _write_json(quality_report_path, quality_report)
+    _write_text(source_path, "# Source Artifact\n\n| Field | Value |\n|---|---|\n| Status | Failed before normal source extraction completed |\n| Product URL | " + request.product_url + " |\n| Error | " + _md_cell(error, max_len=800) + " |\n")
+    _write_text(product_evidence_md_path, "# Product Evidence\n\n| Field | Value |\n|---|---|\n| Artifact quality | insufficient |\n| Reason | Worker exception prevented normal evidence extraction |\n")
+    _write_json(product_evidence_json_path, result.product_evidence)
+    _write_text(claims_path, "# Claims\n\nNo claims were synthesized because the row failed before artifact normalization completed.\n")
+    _write_visual_evidence_md(vision_path, out_dir=out_dir, images=[], decision=_visual_evidence_decision([], image_required=True))
+    _write_json(artifact_manifest_path, _artifact_manifest(scrape_id=sid, input_context=input_context, source_alignment=source_alignment, product_hint=request.resolved_product_hint(), out_dir=out_dir, result=result, images=[], tables=[], evidence=None, quality_report=quality_report))
+    result.elapsed_seconds = 0.0
+    _write_json(result_path, result.to_scrape_result().model_dump())
+    return result
+
+
+__all__ = ["make_scrape_id", "scrape_product", "slug_from_url", "output_dir_for", "write_failed_artifact_for_request"]

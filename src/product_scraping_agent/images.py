@@ -959,13 +959,14 @@ async def download_and_describe(
         n_described, len(picks), _time.monotonic() - t_v, vision_concurrency,
     )
 
-    # Final cleanliness gate. The clean handoff contract is strict:
-    # ``images/`` contains only final vision-confirmed product images. Any
-    # downloaded candidate not selected for rich vision, not described, or
-    # explicitly judged unrelated is deleted from disk but retained in the
-    # manifest with an error/reason. This prevents .bin/.html/non-product
-    # leftovers and avoids noisy visual artifacts downstream.
+    # Final cleanliness gate.
+    # For this project, visual evidence is mandatory. Do NOT delete all useful
+    # downloaded images just because the rich vision-description sidecar failed.
+    # Keep confirmed product images. In degraded vision mode, keep unverified
+    # high-resolution survivors as manual-review visual evidence so downstream
+    # coding still has pixels to inspect.
     _REL_RE = re.compile(r"^\s*RELATED\s*:\s*(yes|no)\b", re.IGNORECASE)
+    keep_unverified = os.getenv("PCA_IMAGE_KEEP_UNVERIFIED_ON_VISION_FAILURE", "1").lower() in {"1", "true", "yes", "y", "on"}
     n_final_dropped = 0
     n_final_kept = 0
     for r in refs:
@@ -973,9 +974,26 @@ async def download_and_describe(
             continue
         rel_match = _REL_RE.match(r.description or "")
         rich_verdict = rel_match.group(1).lower() if rel_match else ""
-        keep = bool(r.description and rich_verdict == "yes")
-        if keep:
+        keep = False
+        if rich_verdict == "yes" or r.relevance == "yes":
+            keep = True
             r.relevance = "yes"
+            if not r.description:
+                r.description = (
+                    "RELATED: yes\n"
+                    "- Product image retained by the relevance gate.\n"
+                    "- Rich vision description was unavailable, but the image file is preserved for downstream inspection."
+                )
+        elif r.relevance == "" and degraded and keep_unverified:
+            keep = True
+            r.relevance = "unverified_kept"
+            if not r.description:
+                r.description = (
+                    "RELATED: unverified\n"
+                    "- Image retained because the vision relevance/description gateway was degraded.\n"
+                    "- Manual review or downstream vision should inspect this image before using it as product evidence."
+                )
+        if keep:
             n_final_kept += 1
             continue
         try:
@@ -986,15 +1004,18 @@ async def download_and_describe(
         if rich_verdict == "no":
             r.error = "unrelated to product (rich-describe verdict)"
             r.relevance = "no"
+            r.description = ""
+        elif r.relevance == "no":
+            r.error = "unrelated to product (relevance verdict)"
+            r.description = ""
         elif not r.description:
             r.error = "not vision-described; removed from clean images folder"
         else:
             r.error = "vision verdict missing/uncertain; removed from clean images folder"
-        r.description = "" if rich_verdict == "no" else r.description
         n_final_dropped += 1
-    if n_final_dropped:
+    if n_final_dropped or n_final_kept:
         logger.info(
-            "  final clean : kept {} vision-confirmed product image(s); removed {} candidate file(s)",
+            "  final clean : kept {} image evidence file(s); removed {} candidate file(s)",
             n_final_kept, n_final_dropped,
         )
 
@@ -1036,4 +1057,74 @@ async def download_and_describe(
     return refs
 
 
-__all__ = ["download_and_describe"]
+async def capture_screenshot_fallback(
+    *,
+    page_url: str,
+    out_dir: Path,
+    product_hint: str = "",
+    timeout: float = 25.0,
+    full_page: bool = False,
+) -> ImageRef:
+    """Capture a page screenshot as last-resort visual evidence.
+
+    This is not treated as a clean product-gallery image. It is a rescue artifact
+    so downstream vision/manual review still has pixels when CDN image downloads
+    fail. It uses Playwright directly because Crawl4AI's public result object does
+    not consistently expose screenshot bytes across versions.
+    """
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    ref = ImageRef(url=page_url, alt="page screenshot fallback")
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover
+        ref.error = f"screenshot fallback unavailable: {type(exc).__name__}: {exc}"
+        return ref
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=BROWSER_HEADERS.get("User-Agent"),
+                viewport={"width": 1366, "height": 1100},
+                extra_http_headers={
+                    "Accept-Language": os.getenv("PCA_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+                },
+            )
+            page = await context.new_page()
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            await page.wait_for_timeout(2500)
+            # Try to place the product area/galleries in view, without assuming retailer-specific selectors.
+            for sel in ["main", "[role=main]", "#dp", "#ppd", "[data-testid*=product]", ".product", ".pdp"]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count():
+                        await loc.scroll_into_view_if_needed(timeout=1000)
+                        break
+                except Exception:
+                    pass
+            path = images_dir / "screenshot_fallback.png"
+            await page.screenshot(path=str(path), full_page=full_page)
+            await context.close()
+            await browser.close()
+        data = path.read_bytes()
+        with Image.open(io.BytesIO(data)) as im:
+            ref.width, ref.height = im.size
+            ref.phash = _compute_phash(im)
+        ref.local_path = path
+        ref.bytes_size = len(data)
+        ref.mime = "image/png"
+        ref.sha8 = hashlib.sha1(data).hexdigest()[:8]
+        ref.download_source = "screenshot_fallback"
+        ref.relevance = "screenshot_fallback"
+        ref.description = (
+            "RELATED: screenshot_fallback\n"
+            "- Page screenshot retained as last-resort visual evidence because clean product image recovery failed.\n"
+            "- This is not a clean gallery image; downstream vision/manual review must inspect it cautiously."
+        )
+        return ref
+    except Exception as exc:  # noqa: BLE001
+        ref.error = f"screenshot fallback failed: {type(exc).__name__}: {exc}"
+        return ref
+
+
+__all__ = ["download_and_describe", "capture_screenshot_fallback"]
