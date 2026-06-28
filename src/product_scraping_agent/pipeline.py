@@ -164,6 +164,7 @@ def _metadata_payload(
         "capture_grade": page.capture_grade,
         "weak_capture_reasons": page.weak_capture_reasons,
         "real_scrape_evidence": page.real_scrape_evidence,
+        "capture_decision": getattr(page, "capture_decision", "not_evaluated"),
         "title": page.title,
         "description": page.description,
         "canonical_url": page.canonical_url,
@@ -257,6 +258,7 @@ def _artifact_manifest(
         "capture_grade": result.capture_grade,
         "weak_capture_reasons": result.weak_capture_reasons,
         "real_scrape_evidence": result.real_scrape_evidence,
+        "capture_decision": getattr(result, "capture_decision", "not_evaluated"),
         "product_details_recovered": result.product_details_recovered,
         "recovery_status": result.recovery_status,
         "evidence_axes_used": result.evidence_axes_used,
@@ -312,6 +314,7 @@ def _artifact_manifest(
             "capture_score": result.capture_score,
             "capture_grade": result.capture_grade,
             "real_scrape_evidence": result.real_scrape_evidence,
+        "capture_decision": getattr(result, "capture_decision", "not_evaluated"),
             "weak_capture_reasons": result.weak_capture_reasons,
             "access_status": result.access_status,
             "geo_restricted": result.geo_restricted,
@@ -432,6 +435,7 @@ async def _agentic_fetch_loop(
         "capture_score": page.capture_score,
         "capture_grade": page.capture_grade,
         "real_scrape_evidence": page.real_scrape_evidence,
+        "capture_decision": getattr(page, "capture_decision", "not_evaluated"),
         "weak_capture_reasons": page.weak_capture_reasons,
         "success": page.success,
         "status": page.status,
@@ -752,6 +756,7 @@ async def scrape_product(
     result.capture_grade = page.capture_grade or "not_evaluated"
     result.weak_capture_reasons = list(page.weak_capture_reasons or [])
     result.real_scrape_evidence = bool(page.real_scrape_evidence)
+    result.capture_decision = getattr(page, "capture_decision", "not_evaluated") or "not_evaluated"
     result.browser_visible = bool(page_capture_health(page).get("browser_product_visible"))
     source_alignment_report = _build_source_alignment_report(
         source_alignment=source_alignment,
@@ -763,7 +768,7 @@ async def scrape_product(
     logger.info("  status    : {} success={} access={} proxy={} in {:.2f}s", page.status, page.success, page.access_status, page.proxy_source or "direct", time.monotonic() - t_step)
     logger.info("  final_url : {}", result.final_url)
     logger.info("  profiles  : selected={} attempted={}", result.capture_profile_used, ", ".join(result.capture_profiles_attempted or page.profiles_merged or [page.fetch_profile]))
-    logger.info("  capture   : score={} grade={} real_scrape_evidence={} weak_reasons={}", result.capture_score, result.capture_grade, result.real_scrape_evidence, result.weak_capture_reasons)
+    logger.info("  capture   : score={} grade={} decision={} real_scrape_evidence={} weak_reasons={}", result.capture_score, result.capture_grade, result.capture_decision, result.real_scrape_evidence, result.weak_capture_reasons)
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
                 len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
     capture_health = page_capture_health(page)
@@ -914,6 +919,7 @@ async def scrape_product(
     evidence.quality.setdefault("capture_score", result.capture_score)
     evidence.quality.setdefault("capture_grade", result.capture_grade)
     evidence.quality.setdefault("real_scrape_evidence", result.real_scrape_evidence)
+    evidence.quality.setdefault("capture_decision", result.capture_decision)
     evidence.quality.setdefault("weak_capture_reasons", result.weak_capture_reasons)
     result.evidence_axes_used = evidence_axes_from_product_evidence(evidence)
     result.product_details_recovered = deterministic_product_details_recovered(evidence)

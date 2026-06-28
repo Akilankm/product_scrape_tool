@@ -13,8 +13,9 @@ import csv
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Iterable
 
 from .agent import ProductScrapingAgent
@@ -48,8 +49,13 @@ DEFAULT_BATCH_OUTPUT_COLUMNS: list[str] = [
     "capture_profiles_attempted",
     "capture_score",
     "capture_grade",
+    "capture_decision",
     "real_scrape_evidence",
     "weak_capture_reasons",
+    "is_weak_capture",
+    "is_block_or_challenge",
+    "has_real_scrape_evidence",
+    "capture_decision_bucket",
     "source_alignment_status",
     "source_claim_scope",
     "requested_retailer_claims_allowed",
@@ -207,6 +213,7 @@ class BatchOptions:
     resume: bool = False
     skip_existing_artifacts: bool = False
     stop_on_error: bool = False
+    domain_profile_learning: bool = True
 
 
 @dataclass(frozen=True)
@@ -222,6 +229,7 @@ class BatchSummary:
     manual_review_rows: int
     elapsed_seconds: float
     quality_counts: dict[str, int]
+    domain_profile_preferences: dict[str, str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -236,6 +244,7 @@ class BatchSummary:
             "manual_review_rows": self.manual_review_rows,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "quality_counts": dict(self.quality_counts),
+            "domain_profile_preferences": dict(self.domain_profile_preferences or {}),
         }
 
 
@@ -322,6 +331,27 @@ def _path_str(path: Path | None) -> str:
     return str(path) if path else ""
 
 
+def _capture_bucket(result: ScrapeResult | None) -> str:
+    if result is None:
+        return "not_created"
+    decision = getattr(result, "capture_decision", "") or ""
+    if decision in {"rich_product_capture", "usable_product_capture"}:
+        return "real_product_capture"
+    if decision == "mixed_capture_needs_review":
+        return "mixed_needs_review"
+    if decision in {"blocked_or_challenge_capture", "blocked_shell_capture"}:
+        return "blocked_or_challenge"
+    if decision in {"input_url_only_artifact", "fetch_failed_input_url_only_artifact"}:
+        return "input_url_only"
+    if decision:
+        return decision
+    if getattr(result, "real_scrape_evidence", False):
+        return "real_product_capture"
+    if getattr(result, "access_status", "") in {"bot_challenge", "access_denied", "fetch_error"}:
+        return "blocked_or_challenge"
+    return "weak_or_unknown"
+
+
 def result_to_output_row(
     *,
     row_number: int,
@@ -359,8 +389,13 @@ def result_to_output_row(
             "capture_profiles_attempted": "",
             "capture_score": 0,
             "capture_grade": "not_evaluated",
+            "capture_decision": "not_evaluated",
             "real_scrape_evidence": False,
             "weak_capture_reasons": "",
+            "is_weak_capture": True,
+            "is_block_or_challenge": False,
+            "has_real_scrape_evidence": False,
+            "capture_decision_bucket": "not_created",
             "source_alignment_status": request.source_alignment.alignment_status,
             "source_claim_scope": request.source_alignment.source_specific_claim_scope,
             "requested_retailer_claims_allowed": request.source_alignment.requested_retailer_claims_allowed,
@@ -419,8 +454,13 @@ def result_to_output_row(
         "capture_profiles_attempted": "; ".join(result.capture_profiles_attempted),
         "capture_score": result.capture_score,
         "capture_grade": result.capture_grade,
+        "capture_decision": getattr(result, "capture_decision", "not_evaluated"),
         "real_scrape_evidence": result.real_scrape_evidence,
         "weak_capture_reasons": "; ".join(result.weak_capture_reasons),
+        "is_weak_capture": bool(result.capture_grade in {"weak", "blocked_or_shell", "mixed_capture"} or getattr(result, "capture_decision", "") in {"blocked_shell_capture", "empty_or_blocked_capture", "weak_no_real_product_capture", "mixed_capture_needs_review"}),
+        "is_block_or_challenge": bool(result.access_status in {"bot_challenge", "access_denied", "geo_restricted", "rate_limited"} or "block" in (getattr(result, "capture_decision", "") or "") or any("block" in str(x).lower() or "challenge" in str(x).lower() for x in result.weak_capture_reasons)),
+        "has_real_scrape_evidence": bool(result.real_scrape_evidence),
+        "capture_decision_bucket": ("rich" if getattr(result, "capture_decision", "") == "rich_product_capture" else "usable" if getattr(result, "capture_decision", "") == "usable_product_capture" else "mixed_review" if getattr(result, "capture_decision", "") == "mixed_capture_needs_review" else "weak" if "weak" in (getattr(result, "capture_decision", "") or "") else "blocked" if "block" in (getattr(result, "capture_decision", "") or "") or "empty" in (getattr(result, "capture_decision", "") or "") else getattr(result, "capture_decision", "not_evaluated") or "unknown"),
         "source_alignment_status": result.source_alignment.alignment_status,
         "source_claim_scope": result.source_alignment.source_specific_claim_scope,
         "requested_retailer_claims_allowed": result.source_alignment.requested_retailer_claims_allowed,
@@ -480,6 +520,33 @@ def _prepare_output_csv(path: Path, *, append: bool) -> tuple[Any, csv.DictWrite
     return handle, writer
 
 
+
+def _domain_from_url(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower().split('@')[-1].split(':')[0]
+        return host[4:] if host.startswith('www.') else host
+    except Exception:
+        return ""
+
+
+def _reordered_sequence(base_sequence: str, preferred_profile: str) -> str:
+    profiles = [p.strip() for p in re.split(r"[,;\s]+", base_sequence or "") if p.strip()]
+    if not preferred_profile:
+        return ",".join(profiles) or base_sequence
+    out = [preferred_profile]
+    out.extend(p for p in profiles if p != preferred_profile)
+    return ",".join(dict.fromkeys(out))
+
+
+def _should_learn_profile(result: ScrapeResult) -> bool:
+    return bool(
+        result
+        and result.real_scrape_evidence
+        and result.capture_profile_used
+        and result.capture_score >= 70
+        and result.capture_decision in {"rich_product_capture", "usable_product_capture", "mixed_capture_needs_review"}
+    )
+
 async def run_batch(
     *,
     input_csv: Path,
@@ -500,7 +567,8 @@ async def run_batch(
     handle, writer = _prepare_output_csv(output_csv, append=append)
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(max(1, options.max_concurrency))
-    agent = ProductScrapingAgent(output_root=options.output_root)
+    base_agent = ProductScrapingAgent(output_root=options.output_root)
+    domain_preferences: dict[str, str] = {}
 
     processed = 0
     skipped = 0
@@ -539,8 +607,22 @@ async def run_batch(
                 if expected.exists():
                     skipped += 1
                     return
+            domain = _domain_from_url(request.product_url)
+            agent = base_agent
+            if options.domain_profile_learning and domain and domain in domain_preferences:
+                preferred = domain_preferences[domain]
+                learned_cfg = replace(
+                    base_agent.config,
+                    scrape_profile_sequence=_reordered_sequence(base_agent.config.scrape_profile_sequence, preferred),
+                )
+                agent = ProductScrapingAgent(config=learned_cfg, output_root=options.output_root)
             async with sem:
                 result = await agent.scrape(request)
+            if options.domain_profile_learning and domain and _should_learn_profile(result):
+                async with lock:
+                    existing = domain_preferences.get(domain)
+                    if not existing or result.capture_score >= 82:
+                        domain_preferences[domain] = result.capture_profile_used
             out_row = result_to_output_row(row_number=row_number, input_id=input_id, request=request, result=result)
             processed += 1
             if result.success:
@@ -596,6 +678,7 @@ async def run_batch(
         manual_review_rows=manual_review,
         elapsed_seconds=time.monotonic() - started,
         quality_counts=quality_counts,
+        domain_profile_preferences=domain_preferences,
     )
     if summary_json:
         summary_json.parent.mkdir(parents=True, exist_ok=True)

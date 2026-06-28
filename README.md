@@ -43,7 +43,7 @@ OUTPUT  : noise-free product evidence artifact folder
 
 The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
-## What changed by v1.2.3
+## What changed by v1.2.4
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
@@ -70,6 +70,8 @@ The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 9. Image CDN recovery retries with browser-like headers/referers and optional Playwright request fallback
 10. Deterministic quality gate writes `quality_report.json` for downstream acceptance/manual-review decisions
 11. Source alignment separates the requested retailer/country from the actual URL evidence source so fallback URLs do not leak retailer-specific claims
+12. Capture scoring is stricter: empty 0KB captures get score 0, image candidates alone do not prove scraping, and `real_scrape_evidence=false` can no longer be labelled `strong`
+13. Batch mode learns the best successful Crawl4AI profile per domain during the same run and tries that profile first for later URLs on that domain
 ```
 
 No web search is performed inside this scraper. No external facts are used unless the caller supplies them as upstream evidence, and those claims are explicitly tagged with `A` evidence axis. No guesses are allowed.
@@ -95,8 +97,12 @@ capture_profile_used
 capture_profiles_attempted
 capture_score
 capture_grade
+capture_decision
 real_scrape_evidence
 weak_capture_reasons
+is_weak_capture
+is_block_or_challenge
+has_real_scrape_evidence
 ```
 
 This prevents a thin HTTP-200 shell page from being treated as a successful product scrape.

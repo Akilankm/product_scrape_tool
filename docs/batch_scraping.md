@@ -125,8 +125,12 @@ Additional output columns:
 | `capture_profile_used` | The selected Crawl4AI profile whose capture was used as primary evidence. |
 | `capture_profiles_attempted` | All same-URL profiles attempted for this row. |
 | `capture_score` | 0–100 deterministic score for the selected browser capture. |
-| `capture_grade` | `strong`, `usable`, `weak`, or `blocked_or_shell`. |
+| `capture_grade` | `strong`, `usable`, `mixed_capture`, `weak`, or `blocked_or_shell`. |
+| `capture_decision` | Business-readable decision such as `rich_product_capture`, `usable_product_capture`, `mixed_capture_needs_review`, `weak_no_real_product_capture`, `input_url_only_artifact`, or `blocked_shell_capture`. |
 | `real_scrape_evidence` | Whether the selected capture contains meaningful product-page evidence beyond input/URL hints. |
+| `is_weak_capture` | Boolean flag for weak/mixed/blocked captures. |
+| `is_block_or_challenge` | Boolean flag for blocked/challenge/access-denied style captures. |
+| `capture_decision_bucket` | Compact grouping: `rich`, `usable`, `mixed_review`, `weak`, `blocked`, or other decision value. |
 | `weak_capture_reasons` | Reasons a capture is considered weak, for example thin shell, challenge text, generic title, or few product signals. |
 
 Recommended production interpretation:
@@ -146,4 +150,20 @@ PCA_SCRAPE_PROFILE_SEQUENCE=standard,load_wait,full_page_scroll,expand_common_se
 PCA_SCRAPE_PROFILE_EARLY_STOP_SCORE=82
 PCA_SCRAPE_PROFILE_MAX_PROFILES=7
 PCA_SCRAPE_ENABLE_STEALTH=true
+```
+
+
+## Domain profile learning
+
+Batch mode can learn the best Crawl4AI profile per domain during the current run.
+
+Example: if `shadow_iframe` succeeds for an Amazon URL, later Amazon URLs in the same batch can try `shadow_iframe` first instead of waiting for earlier weak profiles to fail. This does not introduce search and does not change the URL. It only reorders the same configured Crawl4AI profile list.
+
+Disable it when debugging strict profile order:
+
+```bash
+pdm run scrape-batch \
+  --input-csv data/input.csv \
+  --output-csv data/output.csv \
+  --disable-domain-profile-learning
 ```

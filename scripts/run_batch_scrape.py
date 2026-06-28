@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing-artifacts", action="store_true", help="Skip rows whose artifact_manifest.json already exists")
     parser.add_argument("--stop-on-error", action="store_true", help="Fail the batch on first row exception")
     parser.add_argument("--write-raw-debug", action="store_true", help="Persist raw observed page markdown/html under debug_raw/")
+    parser.add_argument("--disable-domain-profile-learning", action="store_true", help="Do not reorder Crawl4AI profiles based on earlier successful domains in this batch")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -56,6 +57,7 @@ async def async_main() -> None:
             skip_existing_artifacts=args.skip_existing_artifacts,
             stop_on_error=args.stop_on_error,
             write_raw_debug=True if args.write_raw_debug else None,
+            domain_profile_learning=not args.disable_domain_profile_learning,
         ),
     )
     print("\nBATCH SUMMARY")

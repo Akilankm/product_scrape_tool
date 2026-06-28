@@ -217,7 +217,7 @@ def page_capture_health(page: FullPage) -> dict[str, Any]:
     if scorer_reasons:
         weak_reasons = list(dict.fromkeys([*weak_reasons, *scorer_reasons]))
     if capture_score:
-        browser_product_visible = bool(page.success and page.access_status == "accessible" and real_scrape_evidence and capture_grade in {"strong", "usable"})
+        browser_product_visible = bool(page.success and page.access_status == "accessible" and real_scrape_evidence and capture_grade in {"strong", "usable", "mixed_capture"})
     else:
         browser_product_visible = bool(page.success and page.access_status == "accessible" and not weak_reasons)
     status = "product_visible" if browser_product_visible else ("weak_capture" if page.success or html or md else "not_captured")
@@ -231,6 +231,7 @@ def page_capture_health(page: FullPage) -> dict[str, Any]:
         "capture_profile_used": getattr(page, "capture_profile_used", "") or getattr(page, "fetch_profile", ""),
         "capture_profiles_attempted": list(getattr(page, "capture_profiles_attempted", []) or []),
         "real_scrape_evidence": real_scrape_evidence,
+        "capture_decision": getattr(page, "capture_decision", "not_evaluated"),
         "markdown_chars": md_chars,
         "html_chars": html_chars,
         "title": title,
@@ -980,7 +981,7 @@ def build_artifact_quality_report(
         "has_evidence_axes": bool(axes),
         "has_gap_reporting": isinstance(evidence.gaps, list),
         "noise_exclusion_documented": bool(evidence.noise_exclusion_summary),
-        "browser_access_ok_or_recovered": bool(result.browser_visible or result.product_details_recovered or upstream_evidence.has_any() or input_context.has_any()),
+        "browser_access_ok_or_recovered": bool(result.browser_visible or getattr(result, "real_scrape_evidence", False) or upstream_evidence.has_any()),
         "source_alignment_documented": bool(evidence.source_alignment or source_alignment.model_report()),
         "fallback_claim_scope_safe": bool(source_alignment.requested_retailer_claims_allowed or source_alignment.source_specific_claim_scope == "scraped_source_only"),
     }
@@ -1015,8 +1016,10 @@ def build_artifact_quality_report(
         warnings.append("HTTP 200 returned but product-page capture is weak; artifact relies on input/URL/context evidence where needed")
     if not getattr(result, "real_scrape_evidence", False):
         warnings.append("no strong Crawl4AI product-page capture selected; artifact may rely on input/URL evidence")
-    if getattr(result, "capture_grade", "") in {"weak", "blocked_or_shell"}:
+    if getattr(result, "capture_grade", "") in {"weak", "blocked_or_shell", "mixed_capture"}:
         warnings.append(f"selected Crawl4AI capture grade is {getattr(result, 'capture_grade', '')}")
+    if getattr(result, "capture_decision", "") in {"mixed_capture_needs_review", "blocked_shell_capture", "weak_no_real_product_capture", "empty_or_blocked_capture", "blocked_or_challenge_capture", "input_url_only_artifact", "fetch_failed_input_url_only_artifact"}:
+        warnings.append(f"capture decision is {getattr(result, 'capture_decision', 'not_evaluated')}")
     if source_alignment.alignment_status != "primary_requested_source":
         warnings.append(f"source alignment is {source_alignment.alignment_status}; source-specific commercial claims are scoped to {source_alignment.source_specific_claim_scope}")
 
@@ -1037,15 +1040,27 @@ def build_artifact_quality_report(
     if len(warnings) >= 3:
         score -= 10
     if not getattr(result, "real_scrape_evidence", False):
-        score -= 15
+        score -= 25
+    if getattr(result, "capture_decision", "") in {"blocked_shell_capture", "empty_or_blocked_capture"}:
+        score -= 25
+    elif getattr(result, "capture_decision", "") == "mixed_capture_needs_review":
+        score -= 8
     if getattr(result, "capture_grade", "") == "blocked_or_shell":
         score -= 20
+    elif getattr(result, "capture_grade", "") == "mixed_capture":
+        score -= 15
     elif getattr(result, "capture_grade", "") == "weak":
         score -= 10
+    if getattr(result, "capture_decision", "") in {"input_url_only_artifact", "fetch_failed_input_url_only_artifact", "blocked_or_challenge_capture"}:
+        score -= 15
     score = max(0, min(100, score))
 
     if missing:
         artifact_quality = "partial" if score >= 45 else "insufficient"
+    elif not getattr(result, "real_scrape_evidence", False):
+        artifact_quality = "partial" if score >= 55 else "insufficient"
+    elif getattr(result, "capture_decision", "") == "mixed_capture_needs_review":
+        artifact_quality = "usable" if score >= 75 else "partial"
     elif score >= 85 and len(warnings) <= 1:
         artifact_quality = "strong"
     elif score >= 65:
@@ -1053,7 +1068,8 @@ def build_artifact_quality_report(
     else:
         artifact_quality = "partial"
 
-    requires_review = artifact_quality in {"partial", "insufficient"} or bool(missing)
+    review_decisions = {"mixed_capture_needs_review", "blocked_shell_capture", "empty_or_blocked_capture", "weak_no_real_product_capture", "blocked_or_challenge_capture", "input_url_only_artifact", "fetch_failed_input_url_only_artifact", "weak_capture_needs_review"}
+    requires_review = artifact_quality in {"partial", "insufficient"} or bool(missing) or getattr(result, "capture_decision", "") in review_decisions
     recommended_followups: list[str] = []
     if "product_name_or_title" in missing or "product_evidence_content" in missing:
         recommended_followups.append("rerun with max_agent_iterations>=3 and write_raw_debug=true for audit")
@@ -1098,6 +1114,7 @@ def build_artifact_quality_report(
             "capture_score": getattr(result, "capture_score", 0),
             "capture_grade": getattr(result, "capture_grade", "not_evaluated"),
             "real_scrape_evidence": getattr(result, "real_scrape_evidence", False),
+            "capture_decision": getattr(result, "capture_decision", "not_evaluated"),
             "weak_capture_reasons": getattr(result, "weak_capture_reasons", []),
             "capture_health": capture,
         },

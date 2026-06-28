@@ -13,7 +13,7 @@ import inspect
 import os
 import re
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -60,6 +60,12 @@ _BLOCK_TERMS = (
     "enter the characters", "validatecaptcha", "access denied", "request blocked", "verifica tu identidad",
     "verify your identity", "checking your browser", "unusual traffic",
 )
+
+# In-process domain profile memory. This keeps batch runs faster and more stable
+# without introducing any external service or persistent state. If a profile
+# succeeds for amazon.com or kuvertshop.net, the next URL from that domain tries
+# the successful profile first.
+_DOMAIN_PROFILE_MEMORY: dict[str, str] = {}
 
 
 def _tokens(text: str) -> list[str]:
@@ -145,6 +151,7 @@ class FullPage(BaseModel):
     capture_grade: str = "not_evaluated"
     weak_capture_reasons: list[str] = Field(default_factory=list)
     real_scrape_evidence: bool = False
+    capture_decision: str = "not_evaluated"
     capture_profile_used: str = ""
     capture_profiles_attempted: list[str] = Field(default_factory=list)
     capture_profile_scores: list[dict[str, Any]] = Field(default_factory=list)
@@ -454,9 +461,9 @@ def _profile_sequence(cfg: Config) -> list[str]:
 def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str = "") -> dict[str, Any]:
     """Score whether a Crawl4AI profile captured real product evidence.
 
-    HTTP 200 alone is not enough. The score rewards product-like text, structured
-    data, tables, image candidates, and product/EAN matches; it penalizes
-    challenge pages and very thin shells.
+    A 200 response, a single image candidate, or caller input is not enough to
+    mark a page as a real product capture. Rich content with incidental block
+    terms is treated as mixed/needs-review rather than hard-failed.
     """
     md = _coerce_text(page.raw_markdown)
     html = _coerce_text(page.raw_html)
@@ -464,15 +471,44 @@ def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str 
     text = "\n".join([title, page.description or "", md, html[:25_000]]).lower()
     md_chars = len(md)
     html_chars = len(html)
+    payload_chars = md_chars + html_chars
     product_signal_count = sum(1 for term in _PRODUCT_TERMS if term in text)
     block_signal_count = sum(1 for term in _BLOCK_TERMS if term in text)
     generic_title = title.lower() in _GENERIC_TITLES or not title
     structured_count = len(page.json_ld or []) + len(page.tables_html or []) + len(page.og or {}) + len(page.product_meta or {})
     image_count = len(page.images or [])
+    has_payload_text = payload_chars > 0
 
     score = 0
     reasons: list[str] = []
     positives: list[str] = []
+
+    if not has_payload_text and structured_count == 0:
+        reasons.extend(["no_readable_content", "empty_text_payload", "very_low_markdown", "very_low_html"])
+        if image_count:
+            reasons.append("image_candidates_without_text_payload")
+        if page.access_status != "accessible":
+            reasons.append(f"access_status={page.access_status}")
+        return {
+            "profile": page.fetch_profile,
+            "score": 0,
+            "grade": "blocked_or_shell",
+            "capture_decision": "input_url_only_artifact",
+            "real_scrape_evidence": False,
+            "weak_capture": True,
+            "weak_reasons": list(dict.fromkeys(reasons)),
+            "positive_signals": positives,
+            "markdown_chars": md_chars,
+            "html_chars": html_chars,
+            "title": title,
+            "product_signal_count": product_signal_count,
+            "block_signal_count": block_signal_count,
+            "structured_signal_count": structured_count,
+            "image_candidate_count": image_count,
+            "access_status": page.access_status,
+            "status": page.status,
+            "success": page.success,
+        }
 
     if page.access_status == "accessible" and page.success:
         score += 12; positives.append("accessible_success")
@@ -510,12 +546,16 @@ def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str 
         score += min(18, 8 + len(page.tables_html) * 4); positives.append("tables")
     if page.og or page.product_meta:
         score += min(12, 4 + len(page.og) + len(page.product_meta)); positives.append("meta_tags")
-    if image_count >= 12:
-        score += 12; positives.append("many_image_candidates")
-    elif image_count >= 4:
-        score += 7; positives.append("image_candidates")
-    elif image_count == 0:
-        reasons.append("no_image_candidates")
+
+    if has_payload_text or structured_count:
+        if image_count >= 12:
+            score += 12; positives.append("many_image_candidates")
+        elif image_count >= 4:
+            score += 7; positives.append("image_candidates")
+        elif image_count == 0:
+            reasons.append("no_image_candidates")
+    elif image_count:
+        reasons.append("image_candidates_without_text_payload")
 
     if product_signal_count >= 8:
         score += 15; positives.append("many_product_terms")
@@ -530,29 +570,57 @@ def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str 
     elif product_hint or ean:
         reasons.append("no_input_identity_match")
 
-    if block_signal_count:
-        score -= min(60, 30 + block_signal_count * 8); reasons.append("block_or_challenge_terms")
+    severe_block = bool(block_signal_count and (
+        page.access_status != "accessible" or (md_chars < 2_500 and html_chars < 8_000)
+    ))
+    mild_block = bool(block_signal_count and not severe_block)
+    if severe_block:
+        score -= min(70, 35 + block_signal_count * 10); reasons.append("block_or_challenge_terms")
+    elif mild_block:
+        score -= min(18, 6 + block_signal_count * 4); reasons.append("block_terms_present_in_rich_capture")
+
     if md_chars < 1200 and html_chars < 8000 and structured_count == 0:
         score -= 18; reasons.append("thin_shell_no_structured_evidence")
     if generic_title and md_chars < 2500:
         score -= 12; reasons.append("generic_title_with_low_text")
 
+    real_evidence = bool(
+        page.json_ld or page.tables_html or page.product_meta
+        or (md_chars >= 2_500 and product_signal_count >= 3)
+        or (md_chars >= 6_000 and not generic_title)
+        or (html_chars >= 80_000 and image_count >= 4 and product_signal_count >= 2)
+    )
+    if severe_block:
+        real_evidence = False
+
     score = max(0, min(100, score))
-    if score >= 78:
+    if not real_evidence:
+        grade = "blocked_or_shell" if score < 35 else "weak"
+        decision = "blocked_shell_capture" if page.access_status != "accessible" or severe_block else "weak_no_real_product_capture"
+    elif mild_block:
+        grade = "mixed_capture"
+        decision = "mixed_capture_needs_review"
+    elif score >= 78:
         grade = "strong"
+        decision = "rich_product_capture"
     elif score >= 58:
         grade = "usable"
+        decision = "usable_product_capture"
     elif score >= 35:
         grade = "weak"
+        decision = "weak_product_capture"
     else:
         grade = "blocked_or_shell"
-    real_evidence = grade in {"strong", "usable"} or bool(page.json_ld or page.tables_html or (md_chars >= 2500 and product_signal_count >= 3))
+        decision = "blocked_shell_capture"
+        real_evidence = False
+
     return {
         "profile": page.fetch_profile,
         "score": score,
         "grade": grade,
-        "real_scrape_evidence": bool(real_evidence and block_signal_count == 0),
-        "weak_capture": grade in {"weak", "blocked_or_shell"} or block_signal_count > 0,
+        "capture_decision": decision,
+        "real_scrape_evidence": bool(real_evidence),
+        "weak_capture": grade in {"weak", "blocked_or_shell", "mixed_capture"} or decision != "rich_product_capture",
         "weak_reasons": list(dict.fromkeys(reasons)),
         "positive_signals": list(dict.fromkeys(positives)),
         "markdown_chars": md_chars,
@@ -567,13 +635,13 @@ def score_full_page_capture(page: FullPage, *, product_hint: str = "", ean: str 
         "success": page.success,
     }
 
-
 def _apply_capture_score(page: FullPage, *, product_hint: str = "", ean: str = "") -> FullPage:
     diag = score_full_page_capture(page, product_hint=product_hint, ean=ean)
     page.capture_score = int(diag["score"])
     page.capture_grade = str(diag["grade"])
     page.weak_capture_reasons = list(diag.get("weak_reasons") or [])
     page.real_scrape_evidence = bool(diag.get("real_scrape_evidence"))
+    page.capture_decision = str(diag.get("capture_decision") or "not_evaluated")
     page.capture_profile_used = page.fetch_profile
     if not page.capture_profiles_attempted:
         page.capture_profiles_attempted = [page.fetch_profile]
@@ -623,6 +691,30 @@ def _merge_auxiliary_signals(primary: FullPage, extra: FullPage) -> FullPage:
     return p
 
 
+def _domain_key(url: str) -> str:
+    host = (urlparse(url or "").netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _profile_sequence_for_url(cfg: Config, url: str) -> list[str]:
+    profiles = _profile_sequence(cfg)
+    host = _domain_key(url)
+    preferred = _DOMAIN_PROFILE_MEMORY.get(host)
+    if preferred and preferred in profiles:
+        return [preferred, *[p for p in profiles if p != preferred]]
+    return profiles
+
+
+def _remember_domain_profile(url: str, page: FullPage) -> None:
+    host = _domain_key(url)
+    if not host:
+        return
+    if page.capture_decision in {"rich_product_capture", "usable_product_capture"} or (page.real_scrape_evidence and page.capture_score >= 58):
+        _DOMAIN_PROFILE_MEMORY[host] = page.capture_profile_used or page.fetch_profile
+
+
 async def fetch_best_full(
     cfg: Config,
     url: str,
@@ -632,7 +724,7 @@ async def fetch_best_full(
     ean: str = "",
 ) -> FullPage:
     """Run multiple Crawl4AI profiles and return the richest same-URL capture."""
-    profiles = _profile_sequence(cfg) if cfg.scrape_multi_profile_enabled else ["standard"]
+    profiles = _profile_sequence_for_url(cfg, url)
     best: FullPage | None = None
     captures: list[FullPage] = []
     logger.info("full_scraper: multi-profile sequence={}", ", ".join(profiles))
@@ -640,8 +732,8 @@ async def fetch_best_full(
         page = await fetch_full(cfg, url, profile=profile, country_code=country_code, product_hint=product_hint, ean=ean)
         captures.append(page)
         logger.info(
-            "full_scraper[{}]: capture_score={} grade={} real={} weak_reasons={}",
-            profile, page.capture_score, page.capture_grade, page.real_scrape_evidence, page.weak_capture_reasons,
+            "full_scraper[{}]: capture_score={} grade={} decision={} real={} weak_reasons={}",
+            profile, page.capture_score, page.capture_grade, page.capture_decision, page.real_scrape_evidence, page.weak_capture_reasons,
         )
         if best is None or (page.capture_score, len(page.raw_markdown or ""), len(page.images or [])) > (best.capture_score, len(best.raw_markdown or ""), len(best.images or [])):
             best = page
@@ -662,9 +754,10 @@ async def fetch_best_full(
     selected.capture_profile_used = best.fetch_profile
     selected.capture_profiles_attempted = [c.fetch_profile for c in captures]
     selected.capture_profile_scores = [score_full_page_capture(c, product_hint=product_hint, ean=ean) for c in captures]
+    _remember_domain_profile(url, selected)
     logger.info(
-        "full_scraper: selected profile={} score={} grade={} attempted={}",
-        selected.capture_profile_used, selected.capture_score, selected.capture_grade, ", ".join(selected.capture_profiles_attempted),
+        "full_scraper: selected profile={} score={} grade={} decision={} real={} attempted={}",
+        selected.capture_profile_used, selected.capture_score, selected.capture_grade, selected.capture_decision, selected.real_scrape_evidence, ", ".join(selected.capture_profiles_attempted),
     )
     return selected
 

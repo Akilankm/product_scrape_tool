@@ -403,6 +403,7 @@ class ScrapeResult(BaseModel):
     capture_grade: str = "not_evaluated"
     weak_capture_reasons: list[str] = Field(default_factory=list)
     real_scrape_evidence: bool = False
+    capture_decision: str = "not_evaluated"
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
@@ -578,6 +579,7 @@ class ScrapedProduct(BaseModel):
     capture_grade: str = "not_evaluated"
     weak_capture_reasons: list[str] = Field(default_factory=list)
     real_scrape_evidence: bool = False
+    capture_decision: str = "not_evaluated"
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
@@ -643,6 +645,7 @@ class ScrapedProduct(BaseModel):
             capture_grade=self.capture_grade,
             weak_capture_reasons=self.weak_capture_reasons,
             real_scrape_evidence=self.real_scrape_evidence,
+            capture_decision=self.capture_decision,
             input_context=self.input_context,
             upstream_evidence=self.upstream_evidence,
             source_alignment=self.source_alignment,
