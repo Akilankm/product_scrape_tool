@@ -9,7 +9,7 @@ from typing import Any
 
 from .full_scraper import FullPage
 from .log import logger
-from .models import AgentPlan, ImageRef, ProductInputContext, ProductEvidence, TableRef, UpstreamEvidenceBundle
+from .models import AgentPlan, ImageRef, ProductInputContext, ProductEvidence, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
 from .prompts import P
 from .text_utils import truncate_text
 
@@ -50,6 +50,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
         "description": page.description,
         "canonical_url": page.canonical_url,
         "profiles_merged": page.profiles_merged,
+        "source_alignment": source_alignment.model_report(),
         "access": {
             "access_status": page.access_status,
             "access_issue_type": page.access_issue_type,
@@ -67,6 +68,7 @@ def page_observation_summary(page: FullPage, input_context: ProductInputContext,
             "json_ld_blocks": len(page.json_ld),
         },
         "input_context": input_context.model_dump(),
+        "source_alignment": source_alignment.model_report(),
         "product_hint": product_hint,
         "structured_keys": {
             "og": sorted(page.og.keys())[:50],
@@ -241,6 +243,7 @@ def normalize_product_evidence(
     tables: list[TableRef],
     images: list[ImageRef],
     input_context: ProductInputContext,
+    source_alignment: SourceAlignmentContext,
     product_hint: str,
     upstream_evidence: UpstreamEvidenceBundle | None,
     scrape_id: str,
@@ -249,7 +252,16 @@ def normalize_product_evidence(
     from .services.llm import get_llm_service
 
     expected_schema = {
-        "product_focus_summary": "1-3 sentence retailer-claim summary, no guesses",
+        "product_focus_summary": "1-3 sentence product/source summary, no guesses",
+        "source_alignment": {
+            "alignment_status": "primary_requested_source|fallback_source_used|source_context_mismatch|not_declared",
+            "requested_context": {},
+            "scraped_source": {},
+            "product_facts_transfer_allowed": True,
+            "requested_retailer_claims_allowed": False,
+            "source_specific_claim_scope": "scraped_source_only|requested_retailer_and_country",
+            "business_interpretation": "how to interpret this source for product coding"
+        },
         "product_identity": {
             "product_name": {"value": "", "evidence_axis": ["B", "T", "P", "A", "S"], "source_refs": [], "confidence": "high|medium|low|missing"},
             "brand": {"value": "", "evidence_axis": ["B", "T", "P", "A", "V", "S", "D"], "source_refs": [], "confidence": "high|medium|low|missing"},
@@ -261,13 +273,29 @@ def normalize_product_evidence(
         "retailer_claims": [
             {
                 "claim_id": "C001",
-                "attribute": "age_range | piece_count | material | contents | features | category | dimensions | battery | warning | price | availability | etc",
-                "value": "exact value as supported by retailer evidence",
+                "claim_type": "product_level",
+                "attribute": "age_range | piece_count | material | contents | features | category | dimensions | battery | warning | etc",
+                "value": "exact value as supported by evidence",
                 "claim": "complete grounded claim sentence",
                 "evidence_axis": ["T"],
                 "source_refs": ["T: short quote or section label"],
                 "confidence": "high|medium|low",
+                "claim_scope": "product_level_transferable",
                 "notes": "",
+            }
+        ],
+        "source_specific_claims": [
+            {
+                "claim_id": "S001",
+                "claim_type": "source_specific",
+                "attribute": "price | availability | delivery | seller | marketplace_terms | rating | shipping",
+                "value": "exact source-specific value if captured",
+                "claim": "claim scoped only to scraped source unless alignment is primary",
+                "evidence_axis": ["T", "S", "D"],
+                "claim_scope": "scraped_source_only|requested_retailer_and_country",
+                "transfer_to_requested_retailer_allowed": False,
+                "confidence": "high|medium|low",
+                "source_refs": []
             }
         ],
         "product_only_text_blocks": [
@@ -343,22 +371,31 @@ def deterministic_product_evidence(
     tables: list[TableRef],
     images: list[ImageRef],
     input_context: ProductInputContext,
-    product_hint: str,
-    upstream_evidence: UpstreamEvidenceBundle | None,
-    reason: str,
+    source_alignment: SourceAlignmentContext | None = None,
+    product_hint: str = "",
+    upstream_evidence: UpstreamEvidenceBundle | None = None,
+    reason: str = "",
 ) -> ProductEvidence:
     """Safe fallback when the LLM is unavailable; does not pretend to be complete."""
+    source_alignment = source_alignment or SourceAlignmentContext(
+        requested_retailer_name=input_context.retailer_name,
+        requested_country_code=input_context.country_code,
+        source_url_role="unknown",
+    )
+    upstream_evidence = upstream_evidence or UpstreamEvidenceBundle()
     return ProductEvidence(
         product_focus_summary=(
             "LLM product-only normalization was unavailable. This fallback preserves only high-level captured "
             "signals and should not be treated as a complete normalized artifact."
         ),
+        source_alignment=source_alignment.model_report(),
         product_identity={
             "page_title": {"value": page.title, "evidence_axis": ["S", "T"], "source_refs": ["metadata:title"], "confidence": "medium" if page.title else "missing"},
             "canonical_url": {"value": page.canonical_url, "evidence_axis": ["S"], "source_refs": ["metadata:canonical"], "confidence": "medium" if page.canonical_url else "missing"},
             "input_context": input_context.model_dump(),
         },
         retailer_claims=[],
+        source_specific_claims=[],
         product_only_text_blocks=(
             [{
                 "heading": "Upstream evidence text — deterministic recovery",
@@ -391,6 +428,9 @@ def deterministic_product_evidence(
             "product_page_confidence": "low",
             "evidence_completeness": "low",
             "fallback_reason": reason,
+            "source_alignment_status": source_alignment.alignment_status,
+            "requested_retailer_claims_allowed": source_alignment.requested_retailer_claims_allowed,
+            "source_specific_claim_scope": source_alignment.source_specific_claim_scope,
             "created_by": "deterministic_fallback",
         },
     )
@@ -475,6 +515,19 @@ def render_product_evidence_md(evidence: ProductEvidence) -> str:
     if evidence.product_focus_summary:
         lines.extend(["## Executive product summary", "", evidence.product_focus_summary.strip(), ""])
 
+    source_align = data.get("source_alignment") or {}
+    if source_align:
+        lines.extend(["## Source alignment decision table", ""])
+        lines.extend(["| Field | Value |", "|---|---|"])
+        for key in ["alignment_status", "retailer_match", "country_match", "source_specific_claim_scope", "requested_retailer_claims_allowed", "product_facts_transfer_allowed"]:
+            if key in source_align:
+                lines.append(f"| {_cell(key, max_len=180)} | {_cell(source_align.get(key), max_len=420)} |")
+        req = source_align.get("requested_context") or {}
+        src = source_align.get("scraped_source") or {}
+        lines.append(f"| requested_context | {_cell(req, max_len=520)} |")
+        lines.append(f"| scraped_source | {_cell(src, max_len=520)} |")
+        lines.append("")
+
     lines.extend(["## Identity decision table", ""])
     lines.extend(["| Field | Value | Evidence axes | Confidence | Source refs |", "|---|---|---|---|---|"])
     if evidence.product_identity:
@@ -495,7 +548,8 @@ def render_product_evidence_md(evidence: ProductEvidence) -> str:
         lines.append("| Identity | Not captured |  | missing |  |")
     lines.append("")
 
-    _append_claim_table(lines, "Retailer claim decision table", data.get("retailer_claims", []))
+    _append_claim_table(lines, "Product-level retailer claim decision table", data.get("retailer_claims", []))
+    _append_claim_table(lines, "Source-specific commercial claim table", data.get("source_specific_claims", []))
     _append_claim_table(lines, "Structured metadata decision table", data.get("structured_claims", []))
     _append_claim_table(lines, "Table/specification decision table", data.get("table_claims", []))
     _append_claim_table(lines, "Visual evidence decision table", data.get("visual_claims", []))
@@ -668,6 +722,7 @@ def build_artifact_quality_report(
     tables: list[TableRef],
     images: list[ImageRef],
     input_context: ProductInputContext,
+    source_alignment: SourceAlignmentContext,
     upstream_evidence: UpstreamEvidenceBundle,
 ) -> dict[str, Any]:
     """Deterministic quality gate for the final product-only artifact.
@@ -680,6 +735,7 @@ def build_artifact_quality_report(
     identity = evidence.product_identity or {}
     claims_count = (
         len(evidence.retailer_claims or [])
+        + len(evidence.source_specific_claims or [])
         + len(evidence.structured_claims or [])
         + len(evidence.table_claims or [])
         + len(evidence.visual_claims or [])
@@ -711,6 +767,8 @@ def build_artifact_quality_report(
         "has_gap_reporting": isinstance(evidence.gaps, list),
         "noise_exclusion_documented": bool(evidence.noise_exclusion_summary),
         "browser_access_ok_or_recovered": bool(result.browser_visible or result.product_details_recovered or upstream_evidence.has_any()),
+        "source_alignment_documented": bool(evidence.source_alignment or source_alignment.model_report()),
+        "fallback_claim_scope_safe": bool(source_alignment.requested_retailer_claims_allowed or source_alignment.source_specific_claim_scope == "scraped_source_only"),
     }
 
     missing: list[str] = []
@@ -724,6 +782,8 @@ def build_artifact_quality_report(
         missing.append("product_evidence_content")
     if not checks["has_evidence_axes"]:
         missing.append("evidence_axis_tags")
+    if not checks["source_alignment_documented"]:
+        missing.append("source_alignment")
 
     warnings: list[str] = []
     if download_403:
@@ -736,6 +796,8 @@ def build_artifact_quality_report(
         warnings.append("no table or JSON-LD product data captured")
     if result.access_status != "accessible":
         warnings.append(f"browser access status is {result.access_status}; evidence recovery mode used")
+    if source_alignment.alignment_status != "primary_requested_source":
+        warnings.append(f"source alignment is {source_alignment.alignment_status}; source-specific commercial claims are scoped to {source_alignment.source_specific_claim_scope}")
 
     # Score favours multiple independent axes over volume. This is deliberately
     # conservative because the artifact is used downstream for product coding.
@@ -748,6 +810,7 @@ def build_artifact_quality_report(
     score += 10 if checks["has_table_or_structured_evidence"] else 0
     score += 10 if checks["has_visual_evidence"] else 0
     score += 10 if checks["has_evidence_axes"] else 0
+    score += 5 if checks["source_alignment_documented"] else 0
     if claims_count >= 5:
         score += 5
     if len(warnings) >= 3:
@@ -786,6 +849,7 @@ def build_artifact_quality_report(
         "evidence_axes_used": axes,
         "counts": {
             "retailer_claims": len(evidence.retailer_claims or []),
+            "source_specific_claims": len(evidence.source_specific_claims or []),
             "structured_claims": len(evidence.structured_claims or []),
             "table_claims": len(evidence.table_claims or []),
             "visual_claims": len(evidence.visual_claims or []),
@@ -798,6 +862,7 @@ def build_artifact_quality_report(
             "tables": len(tables),
             "json_ld_blocks": len(page.json_ld or []),
         },
+        "source_alignment": source_alignment.model_report(),
         "access": {
             "access_status": result.access_status,
             "browser_visible": result.browser_visible,
@@ -818,8 +883,9 @@ def synthesize_claims_md_from_evidence(evidence: ProductEvidence) -> str:
         "Create claims.md from this normalized product-only evidence JSON. "
         "Do not add new facts. Do not include navigation/footer/recommendations/noise. "
         "The output must be business-readable and table-first. Use concise tables, not text-heavy prose. "
-        "Required sections: 1) Executive decision summary table, 2) Identity table, "
-        "3) Retailer claims table, 4) Visual evidence table, 5) Specifications/table evidence, "
+        "Include a Source Alignment table before claims. Keep product-level claims separate from source-specific commercial claims. "
+        "Required sections: 1) Executive decision summary table, 2) Source alignment table, 3) Identity table, "
+        "4) Product-level claims table, 5) Source-specific commercial claims table, 6) Visual evidence table, 7) Specifications/table evidence, "
         "6) Gaps and discrepancies table, 7) Final downstream-readiness decision. "
         "Every material row must include evidence axes and confidence.\n\n"
         f"```json\n{json.dumps(evidence.model_dump(), ensure_ascii=False, indent=2)}\n```"

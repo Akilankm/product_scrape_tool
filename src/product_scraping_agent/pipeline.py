@@ -36,7 +36,7 @@ from .config import Config, get_config
 from .full_scraper import FullPage, fetch_full, merge_full_pages, table_html_to_markdown
 from .images import download_and_describe
 from .log import logger
-from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapedProduct, TableRef, UpstreamEvidenceBundle
+from .models import ImageRef, ProductEvidence, ProductInputContext, ScrapedProduct, SourceAlignmentContext, TableRef, UpstreamEvidenceBundle
 from .text_utils import truncate_text
 
 _MAX_TABLES = 40
@@ -133,11 +133,13 @@ def _write_table_artifacts(out_dir: Path, tables: list[TableRef]) -> list[TableR
 def _metadata_payload(
     page: FullPage,
     input_context: ProductInputContext,
+    source_alignment: SourceAlignmentContext,
     product_hint: str,
     upstream_evidence: UpstreamEvidenceBundle,
 ) -> dict[str, Any]:
     return {
         "input_context": input_context.model_dump(),
+        "source_alignment": source_alignment.model_report(),
         "upstream_evidence_present": upstream_evidence.has_any(),
         "upstream_evidence": upstream_evidence.compact(max_chars=12_000) if upstream_evidence.has_any() else {},
         "product_hint": product_hint,
@@ -212,6 +214,7 @@ def _artifact_manifest(
     *,
     scrape_id: str,
     input_context: ProductInputContext,
+    source_alignment: SourceAlignmentContext,
     product_hint: str,
     out_dir: Path,
     result: ScrapedProduct,
@@ -222,9 +225,10 @@ def _artifact_manifest(
 ) -> dict[str, Any]:
     quality = evidence.quality if evidence else {}
     return {
-        "artifact_version": "product_scrape.v6.clean_images_table_md",
+        "artifact_version": "product_scrape.v7.source_alignment",
         "scrape_id": scrape_id,
         "input_context": input_context.model_dump(),
+        "source_alignment": source_alignment.model_report(),
         "product_hint": product_hint,
         "product_url": result.url,
         "final_url": result.final_url,
@@ -251,6 +255,7 @@ def _artifact_manifest(
             "noise_report_json": _safe_rel(result.noise_report_json_path, out_dir),
             "evidence_recovery_report_json": _safe_rel(result.evidence_recovery_report_json_path, out_dir),
             "quality_report_json": _safe_rel(result.quality_report_json_path, out_dir),
+            "source_alignment_report_json": _safe_rel(result.source_alignment_report_json_path, out_dir),
             "agent_trace_json": _safe_rel(result.agent_trace_json_path, out_dir),
             "image_manifest_json": _safe_rel(result.image_manifest_path, out_dir),
             "table_manifest_json": _safe_rel(result.table_manifest_path, out_dir),
@@ -292,11 +297,51 @@ def _artifact_manifest(
             "quality_gate": (quality_report or {}).get("artifact_quality", "not_evaluated"),
             "requires_manual_review": bool((quality_report or {}).get("requires_manual_review", False)),
             "missing_critical_fields": (quality_report or {}).get("missing_critical_fields", []),
+            "source_alignment_status": source_alignment.alignment_status,
+            "requested_retailer_claims_allowed": source_alignment.requested_retailer_claims_allowed,
+            "source_specific_claim_scope": source_alignment.source_specific_claim_scope,
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
+
+
+def _build_source_alignment_report(
+    *,
+    source_alignment: SourceAlignmentContext,
+    final_url: str,
+    page_title: str,
+) -> dict[str, Any]:
+    """Machine-readable policy for requested context vs scraped source.
+
+    This is generic and does not hardcode any retailer. It prevents an alternate
+    fallback URL from being treated as if it were the originally requested
+    retailer/country.
+    """
+    report = source_alignment.model_report()
+    report["scraped_source"]["final_url"] = final_url
+    report["scraped_source"]["page_title"] = page_title
+    report["claim_policy"] = {
+        "product_level_claims": {
+            "allowed": True,
+            "scope": "product_identity_and_product_facts",
+            "examples": ["brand", "product name", "EAN/GTIN", "manufacturer", "features", "contents", "age range", "images"],
+            "condition": "must be evidence-grounded and tagged with source axes",
+        },
+        "retailer_specific_claims": {
+            "allowed_for_requested_retailer": source_alignment.requested_retailer_claims_allowed,
+            "scope": source_alignment.source_specific_claim_scope,
+            "examples": ["price", "availability", "delivery", "seller", "marketplace terms", "ratings", "shipping"],
+            "condition": "do not transfer from alternate/fallback source to requested retailer/country",
+        },
+    }
+    report["interpretation"] = (
+        "The provided product_url is the scraped evidence source. The requested retailer/country context "
+        "may differ from that source. Downstream systems must use product-level facts only when evidence-grounded, "
+        "and must keep source-specific commercial claims scoped to the scraped source unless alignment is primary."
+    )
+    return report
 
 
 def _deterministic_followup_action(page: FullPage, used_actions: dict[str, int]) -> tuple[str, str] | None:
@@ -330,12 +375,14 @@ async def _agentic_fetch_loop(
     url: str,
     *,
     input_context: ProductInputContext,
+    source_alignment: SourceAlignmentContext,
     product_hint: str,
     max_iterations: int,
 ) -> tuple[FullPage, list[dict[str, Any]]]:
     """Initial scrape plus LLM-planned same-page follow-up passes."""
     trace: list[dict[str, Any]] = []
-    page = await fetch_full(cfg, url, profile="standard", country_code=input_context.country_code)
+    fetch_country = source_alignment.source_country_code or source_alignment.requested_country_code or input_context.country_code
+    page = await fetch_full(cfg, url, profile="standard", country_code=fetch_country)
     trace.append({
         "iteration": 0,
         "profile": "standard",
@@ -380,7 +427,7 @@ async def _agentic_fetch_loop(
                 iteration, action, reason[:180],
             )
             used_actions[action] = used_actions.get(action, 0) + 1
-            followup = await fetch_full(cfg, url, profile=action, country_code=input_context.country_code)
+            followup = await fetch_full(cfg, url, profile=action, country_code=fetch_country)
             before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
             page = merge_full_pages(page, followup)
             after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
@@ -412,7 +459,7 @@ async def _agentic_fetch_loop(
 
         used_actions[chosen.action] = used_actions.get(chosen.action, 0) + 1
         logger.info("  agent plan : iteration={} action={} reason={}", iteration, chosen.action, chosen.reason[:180])
-        followup = await fetch_full(cfg, url, profile=chosen.action, country_code=input_context.country_code)
+        followup = await fetch_full(cfg, url, profile=chosen.action, country_code=fetch_country)
         before = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
         page = merge_full_pages(page, followup)
         after = (len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
@@ -475,6 +522,9 @@ def _source_md_from_product_evidence(evidence: ProductEvidence) -> str:
         "| Raw page dump | Not emitted here |",
         "| Noisy site content | Excluded |",
         "| Product claims | Retained only when evidence-grounded |",
+        "| Source alignment | Requested retailer/country and scraped source are tracked separately |",
+        f"| Alignment status | {_md_cell((data.get('source_alignment') or {}).get('alignment_status', ''), max_len=180)} |",
+        f"| Source-specific claim scope | {_md_cell((data.get('source_alignment') or {}).get('source_specific_claim_scope', ''), max_len=180)} |",
     ])
     return "\n".join(lines).strip() + "\n"
 
@@ -493,6 +543,12 @@ async def scrape_product(
     ean: str = "",
     retailer_name: str = "",
     country_code: str = "",
+    requested_retailer_name: str = "",
+    requested_country_code: str = "",
+    source_retailer_name: str = "",
+    source_country_code: str = "",
+    source_url_role: str = "unknown",
+    source_alignment: SourceAlignmentContext | None = None,
     upstream_evidence: UpstreamEvidenceBundle | None = None,
     max_agent_iterations: int | None = None,
     strict_product_only: bool = True,
@@ -506,11 +562,21 @@ async def scrape_product(
     """
     cfg = config or get_config()
     sid = (scrape_id or make_scrape_id()).strip()
+    requested_retailer = (requested_retailer_name or retailer_name or "").strip()
+    requested_country = (requested_country_code or country_code or "").strip().upper()
     input_context = ProductInputContext(
         main_text=main_text.strip(),
         ean=ean.strip(),
-        retailer_name=retailer_name.strip(),
-        country_code=country_code.strip(),
+        retailer_name=requested_retailer,
+        country_code=requested_country,
+    )
+    source_alignment = source_alignment or SourceAlignmentContext(
+        product_url=url,
+        requested_retailer_name=requested_retailer,
+        requested_country_code=requested_country,
+        source_retailer_name=(source_retailer_name or "").strip(),
+        source_country_code=(source_country_code or "").strip().upper(),
+        source_url_role=(source_url_role or "unknown").strip(),
     )
     upstream_bundle = upstream_evidence or UpstreamEvidenceBundle()
     resolved_hint = (product_hint or "").strip() or input_context.compact_hint()
@@ -536,6 +602,7 @@ async def scrape_product(
     noise_report_path = out_dir / "noise_report.json"
     evidence_recovery_report_path = out_dir / "evidence_recovery_report.json"
     quality_report_path = out_dir / "quality_report.json"
+    source_alignment_report_path = out_dir / "source_alignment_report.json"
     agent_trace_path = manifests_dir / "agent_trace.json"
     image_manifest_path = manifests_dir / "image_manifest.json"
     table_manifest_path = manifests_dir / "table_manifest.json"
@@ -546,6 +613,7 @@ async def scrape_product(
         url=url,
         output_dir=out_dir,
         input_context=input_context,
+        source_alignment=source_alignment,
         upstream_evidence=upstream_bundle,
         request_json_path=request_path,
         scrape_result_json_path=result_path,
@@ -558,6 +626,7 @@ async def scrape_product(
         noise_report_json_path=noise_report_path,
         evidence_recovery_report_json_path=evidence_recovery_report_path,
         quality_report_json_path=quality_report_path,
+        source_alignment_report_json_path=source_alignment_report_path,
         agent_trace_json_path=agent_trace_path,
         image_manifest_path=image_manifest_path,
         table_manifest_path=table_manifest_path,
@@ -571,6 +640,12 @@ async def scrape_product(
         "ean": input_context.ean,
         "retailer_name": input_context.retailer_name,
         "country_code": input_context.country_code,
+        "requested_retailer_name": source_alignment.requested_retailer_name,
+        "requested_country_code": source_alignment.requested_country_code,
+        "source_retailer_name": source_alignment.source_retailer_name,
+        "source_country_code": source_alignment.source_country_code,
+        "source_url_role": source_alignment.source_url_role,
+        "source_alignment": source_alignment.model_report(),
         "product_hint": resolved_hint,
         "upstream_evidence_present": upstream_bundle.has_any(),
         "upstream_evidence": upstream_bundle.compact(max_chars=20_000) if upstream_bundle.has_any() else {},
@@ -600,6 +675,8 @@ async def scrape_product(
         logger.info("  context   : main_text={!r} ean={} retailer={!r} country={}",
                     input_context.main_text[:70], input_context.ean or "-",
                     input_context.retailer_name or "-", input_context.country_code or "-")
+    logger.info("  requested : retailer={!r} country={}", source_alignment.requested_retailer_name or "-", source_alignment.requested_country_code or "-")
+    logger.info("  source    : retailer={!r} country={} role={} alignment={}", source_alignment.source_retailer_name or "-", source_alignment.source_country_code or "-", source_alignment.source_url_role, source_alignment.alignment_status)
     if upstream_bundle.has_any():
         logger.info("  upstream  : evidence bundle present (AI/search/snippets) — recovery mode enabled")
 
@@ -611,6 +688,7 @@ async def scrape_product(
         cfg,
         url,
         input_context=input_context,
+        source_alignment=source_alignment,
         product_hint=resolved_hint,
         max_iterations=loop_iterations,
     )
@@ -629,6 +707,12 @@ async def scrape_product(
     result.proxy_source = page.proxy_source
     result.access_attempts = list(page.access_attempts or [])
     result.browser_visible = bool(page.success and (page.raw_markdown or page.raw_html) and page.access_status == "accessible")
+    source_alignment_report = _build_source_alignment_report(
+        source_alignment=source_alignment,
+        final_url=result.final_url,
+        page_title=result.title,
+    )
+    _write_json(source_alignment_report_path, source_alignment_report)
     _write_json(agent_trace_path, trace)
     logger.info("  status    : {} success={} access={} proxy={} in {:.2f}s", page.status, page.success, page.access_status, page.proxy_source or "direct", time.monotonic() - t_step)
     logger.info("  final_url : {}", result.final_url)
@@ -636,7 +720,7 @@ async def scrape_product(
     logger.info("  payload   : md={:,}B images={} tables={} json_ld={}",
                 len(page.raw_markdown or ""), len(page.images), len(page.tables_html), len(page.json_ld))
 
-    _write_json(metadata_path, _metadata_payload(page, input_context, resolved_hint, upstream_bundle))
+    _write_json(metadata_path, _metadata_payload(page, input_context, source_alignment, resolved_hint, upstream_bundle))
     if raw_debug_enabled:
         result.raw_debug_dir = _write_debug_raw(out_dir, page)
         logger.info("  debug_raw : {}", result.raw_debug_dir)
@@ -678,6 +762,7 @@ async def scrape_product(
         _write_json(artifact_manifest_path, _artifact_manifest(
             scrape_id=sid,
             input_context=input_context,
+            source_alignment=source_alignment,
             product_hint=resolved_hint,
             out_dir=out_dir,
             result=result,
@@ -734,7 +819,7 @@ async def scrape_product(
     norm_err = ""
     if not cfg.llm_enabled:
         evidence = deterministic_product_evidence(
-            page=page, tables=tables, images=refs, input_context=input_context,
+            page=page, tables=tables, images=refs, input_context=input_context, source_alignment=source_alignment,
             product_hint=resolved_hint, upstream_evidence=upstream_bundle, reason="PCA_LLM_ENABLED=false",
         )
     else:
@@ -745,6 +830,7 @@ async def scrape_product(
                 tables=tables,
                 images=refs,
                 input_context=input_context,
+                source_alignment=source_alignment,
                 product_hint=resolved_hint,
                 upstream_evidence=upstream_bundle,
                 scrape_id=sid,
@@ -753,12 +839,17 @@ async def scrape_product(
             norm_err = f"{type(exc).__name__}: {exc}"
             logger.warning("  product evidence normalization failed: {}", norm_err)
             evidence = deterministic_product_evidence(
-                page=page, tables=tables, images=refs, input_context=input_context,
+                page=page, tables=tables, images=refs, input_context=input_context, source_alignment=source_alignment,
                 product_hint=resolved_hint, upstream_evidence=upstream_bundle, reason=norm_err,
             )
             result.error = f"product evidence fallback used: {norm_err}"
 
-    # Stamp runtime quality values without overwriting LLM claims.
+    # Stamp runtime/source-alignment values without overwriting LLM claims.
+    if not evidence.source_alignment:
+        evidence.source_alignment = source_alignment.model_report()
+    evidence.quality.setdefault("source_alignment_status", source_alignment.alignment_status)
+    evidence.quality.setdefault("requested_retailer_claims_allowed", source_alignment.requested_retailer_claims_allowed)
+    evidence.quality.setdefault("source_specific_claim_scope", source_alignment.source_specific_claim_scope)
     evidence.quality.setdefault("agentic_iterations_used", result.agent_iterations)
     evidence.quality.setdefault("profiles_merged", page.profiles_merged)
     evidence.quality.setdefault("strict_product_only", strict_product_only)
@@ -849,6 +940,7 @@ async def scrape_product(
         tables=tables,
         images=refs,
         input_context=input_context,
+        source_alignment=source_alignment,
         upstream_evidence=upstream_bundle,
     )
     _write_json(quality_report_path, quality_report)
@@ -870,6 +962,7 @@ async def scrape_product(
     _write_json(artifact_manifest_path, _artifact_manifest(
         scrape_id=sid,
         input_context=input_context,
+        source_alignment=source_alignment,
         product_hint=resolved_hint,
         out_dir=out_dir,
         result=result,

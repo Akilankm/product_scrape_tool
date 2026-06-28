@@ -16,8 +16,13 @@ Optional:
 {
   "main_text": "source product text",
   "ean": "5702017153647",
-  "retailer_name": "Retailer name",
-  "country_code": "CZ",
+  "retailer_name": "Requested retailer name — backward-compatible alias",
+  "country_code": "Requested country code — backward-compatible alias",
+  "requested_retailer_name": "Original target retailer name",
+  "requested_country_code": "Original target country code",
+  "source_retailer_name": "Actual retailer/source represented by product_url, if known",
+  "source_country_code": "Actual country/market represented by product_url, if known",
+  "source_url_role": "primary_requested_retailer | alternate_retailer_same_country | alternate_retailer_different_country | same_retailer_different_country | marketplace_fallback | global_fallback | unknown",
   "product_hint": "override context shown to image/planner/evidence LLM",
   "upstream_ai_evidence": "optional AI/search evidence already produced upstream",
   "candidate_snippets": ["optional indexed/search snippets already produced upstream"],
@@ -46,6 +51,7 @@ vision.md
 metadata.json
 noise_report.json
 evidence_recovery_report.json
+source_alignment_report.json
 quality_report.json
 tables/
 images/
@@ -63,6 +69,7 @@ manifests/artifact_manifest.json
 - `source.md` contains product-only text blocks, not full raw page markdown.
 - `noise_report.json` records the exclusion policy without storing raw noisy text.
 - `evidence_recovery_report.json` explains whether browser access was visible, whether product details were recovered, and which evidence axes were used.
+- `source_alignment_report.json` separates requested retailer/country from the actual scraped source and scopes fallback-source commercial claims safely.
 - `quality_report.json` is a deterministic acceptance gate for downstream product coding. It reports `strong`, `usable`, `partial`, or `insufficient`, plus missing critical fields and warnings.
 - `debug_raw/` is disabled by default and only exists if explicitly enabled.
 
@@ -90,11 +97,50 @@ product_evidence.md
 claims.md
 source.md
 metadata.json
+source_alignment_report.json
 vision.md
 images/
 tables/
 manifests/artifact_manifest.json
 ```
+
+## Source alignment contract
+
+The input URL may be an alternate or fallback source. Therefore the agent separates:
+
+```text
+requested target context  = original retailer/country from the business/search row
+actual scraped source     = product_url and optional source retailer/country
+```
+
+`source_alignment_report.json` records:
+
+```json
+{
+  "requested_context": {"retailer_name": "Requested Retailer", "country_code": "CO"},
+  "scraped_source": {
+    "product_url": "https://fallback.example/product/123",
+    "retailer_name": "Fallback Retailer",
+    "country_code": "US",
+    "source_url_role": "global_fallback"
+  },
+  "alignment_status": "fallback_source_used",
+  "retailer_match": false,
+  "country_match": false,
+  "product_facts_transfer_allowed": true,
+  "requested_retailer_claims_allowed": false,
+  "source_specific_claim_scope": "scraped_source_only"
+}
+```
+
+Claim scoping rule:
+
+| Claim type | Fallback source allowed? | Scope |
+|---|---:|---|
+| Product identity/facts: brand, product name, EAN/GTIN, manufacturer, features, contents, age range, images | Yes, if evidence-grounded | Product-level |
+| Commercial/source-specific: price, availability, delivery, seller, marketplace terms, shipping, ratings | Only for scraped source unless alignment is primary | Source-specific only |
+
+No retailer or country is hardcoded. The model is generic and data-driven from the provided request fields.
 
 
 ## Access / geo restriction contract

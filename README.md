@@ -36,14 +36,14 @@ If install hangs at `jedi`, it is almost always from the notebook dependency cha
 
 ```text
 INPUT   : product_url
-OPTIONAL: main_text, ean, retailer_name, country_code, product_hint
+OPTIONAL: main_text, ean, requested retailer/country, actual source retailer/country, source_url_role, product_hint
 OPTIONAL RECOVERY EVIDENCE: upstream_ai_evidence, candidate_snippets, search_evidence
 OUTPUT  : noise-free product evidence artifact folder
 ```
 
 The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
 
-## What changed in v1.1.6
+## What changed in v1.1.7
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
@@ -61,6 +61,7 @@ The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 7. If browser access is blocked/weak, Evidence Recovery Mode can use caller-supplied upstream AI/search evidence without performing search itself
 8. Image CDN recovery retries with browser-like headers/referers and optional Playwright request fallback
 9. Deterministic quality gate writes `quality_report.json` for downstream acceptance/manual-review decisions
+10. Source alignment separates the requested retailer/country from the actual URL evidence source so fallback URLs do not leak retailer-specific claims
 ```
 
 No web search is performed inside this scraper. No external facts are used unless the caller supplies them as upstream evidence, and those claims are explicitly tagged with `A` evidence axis. No guesses are allowed.
@@ -94,8 +95,15 @@ result = await ProductScrapingAgent().scrape(
         product_url="https://retailer.example/product/123",
         main_text="LEGO DUPLO 10965 Bath Time Fun",
         ean="5702017153647",
-        retailer_name="Example Retailer",
-        country_code="CZ",
+        # Backward-compatible aliases for requested context
+        retailer_name="Requested Retailer",
+        country_code="CO",
+
+        # Optional actual URL/source context when product_url is a fallback source
+        source_retailer_name="Fallback Retailer",
+        source_country_code="US",
+        source_url_role="global_fallback",
+
         output_root=Path("data/scraped"),
         max_agent_iterations=2,
 
@@ -119,8 +127,11 @@ pdm run python scripts/run_scrape.py \
   --url "https://retailer.example/product/123" \
   --main-text "LEGO DUPLO 10965 Bath Time Fun" \
   --ean "5702017153647" \
-  --retailer-name "Example Retailer" \
-  --country-code "CZ" \
+  --requested-retailer-name "Requested Retailer" \
+  --requested-country-code "CO" \
+  --source-retailer-name "Fallback Retailer" \
+  --source-country-code "US" \
+  --source-url-role "global_fallback" \
   --max-agent-iterations 2 \
   --upstream-ai-evidence-file evidence/ai_mode.txt \
   --candidate-snippet "Indexed retailer snippet..." \
@@ -151,6 +162,7 @@ data/scraped/<scrape_id>/
     ├── metadata.json                  # structured page metadata and capture counts
     ├── noise_report.json              # confirms noisy page/site content was excluded
     ├── evidence_recovery_report.json  # browser/proxy/upstream evidence recovery audit
+    ├── source_alignment_report.json   # requested context vs actual scraped source policy
     ├── quality_report.json            # deterministic artifact completeness gate
     ├── tables/
     │   ├── table_001.md
@@ -181,10 +193,35 @@ Use these files first:
 | `vision.md` | Product-relevant image observations. |
 | `metadata.json` | Canonical URL, title, JSON-LD, OG/product metadata, capture counts. |
 | `evidence_recovery_report.json` | Explains whether the browser saw the page, whether product details were recovered, and which evidence sources were used. |
+| `source_alignment_report.json` | Separates requested retailer/country from actual scraped source and scopes fallback-source commercial claims safely. |
 | `quality_report.json` | Deterministic quality gate: strong/usable/partial/insufficient, missing fields, warnings, and follow-up recommendations. |
 | `tables/` | HTML tables converted to Markdown for spec evidence. |
 | `images/` | Downloaded product images retained by relevance filtering. |
 | `manifests/agent_trace.json` | LLM planner decisions and same-page iterative scrape actions. |
+
+
+## Requested context vs actual evidence source
+
+The provided `product_url` may be a fallback source. The agent does **not** assume that `retailer_name/country_code` equals the retailer/country of the URL.
+
+Use these fields when the requested market and actual URL source differ:
+
+| Field | Meaning |
+|---|---|
+| `requested_retailer_name` / `retailer_name` | Original target retailer from the business/search row. |
+| `requested_country_code` / `country_code` | Original target country/market. |
+| `source_retailer_name` | Actual retailer/source represented by `product_url`, if known. |
+| `source_country_code` | Actual country/market of `product_url`, if known. |
+| `source_url_role` | Role of the provided URL, e.g. `primary_requested_retailer`, `alternate_retailer_same_country`, `alternate_retailer_different_country`, `same_retailer_different_country`, `marketplace_fallback`, `global_fallback`, or `unknown`. |
+
+Claim policy:
+
+| Claim type | Fallback URL can support it? | Scope |
+|---|---:|---|
+| Brand, product name, EAN/GTIN, manufacturer, product features, contents, age range, images | Yes, if evidence-grounded | Product-level facts |
+| Price, availability, delivery, seller, marketplace terms, shipping, ratings | Source-specific only unless alignment is primary | Do not transfer to requested retailer/country |
+
+The report is written to `source_alignment_report.json` and reflected in `product_evidence.json`, `product_evidence.md`, `claims.md`, `quality_report.json`, and `artifact_manifest.json`.
 
 ## Evidence axes
 

@@ -13,7 +13,12 @@ _DTO_CONFIG = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
 
 class ProductInputContext(BaseModel):
-    """Optional product identity hints supplied alongside the URL."""
+    """Optional product identity hints supplied alongside the URL.
+
+    `retailer_name` and `country_code` represent the requested/target market
+    context for backward compatibility. Actual scraped source context is stored
+    separately in SourceAlignmentContext.
+    """
 
     model_config = _DTO_CONFIG
 
@@ -39,8 +44,8 @@ class ProductInputContext(BaseModel):
         rows = [
             ("main_text", self.main_text),
             ("ean", self.ean),
-            ("retailer_name", self.retailer_name),
-            ("country_code", self.country_code),
+            ("requested_retailer_name", self.retailer_name),
+            ("requested_country_code", self.country_code),
         ]
         body = "\n".join(f"- {k}: {v or '(not provided)'}" for k, v in rows)
         return body
@@ -52,9 +57,9 @@ class ProductInputContext(BaseModel):
         if self.ean:
             parts.append(f"EAN {self.ean}")
         if self.retailer_name:
-            parts.append(f"retailer {self.retailer_name}")
+            parts.append(f"requested retailer {self.retailer_name}")
         if self.country_code:
-            parts.append(f"country {self.country_code}")
+            parts.append(f"requested country {self.country_code}")
         return " | ".join(parts) or fallback
 
 
@@ -113,6 +118,120 @@ class UpstreamEvidenceBundle(BaseModel):
         return data
 
 
+
+
+class SourceAlignmentContext(BaseModel):
+    """Separates the requested market from the actual URL evidence source.
+
+    This prevents fallback URLs from contaminating requested-retailer claims.
+    Example pattern handled generically: requested retailer/country may be X,
+    while the provided product_url is scraped from Y. No retailer-specific logic
+    is hardcoded; the artifact records the alignment and scopes claims safely.
+    """
+
+    model_config = _DTO_CONFIG
+
+    product_url: str = ""
+
+    # Original target/market context from the caller/business row.
+    requested_retailer_name: str = ""
+    requested_country_code: str = ""
+
+    # Actual source URL context. Caller may supply it when known; otherwise the
+    # agent records it as unknown instead of guessing.
+    source_retailer_name: str = ""
+    source_country_code: str = ""
+    source_url_role: str = "unknown"
+
+    @field_validator("requested_country_code", "source_country_code")
+    @classmethod
+    def normalize_country(cls, value: str) -> str:
+        return (value or "").strip().upper()
+
+    @field_validator("source_url_role")
+    @classmethod
+    def normalize_role(cls, value: str) -> str:
+        role = (value or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+        return role or "unknown"
+
+    @staticmethod
+    def _norm_name(value: str) -> str:
+        return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+    @property
+    def retailer_match(self) -> bool | None:
+        requested = self._norm_name(self.requested_retailer_name)
+        source = self._norm_name(self.source_retailer_name)
+        if not requested or not source:
+            return None
+        return requested == source
+
+    @property
+    def country_match(self) -> bool | None:
+        if not self.requested_country_code or not self.source_country_code:
+            return None
+        return self.requested_country_code == self.source_country_code
+
+    @property
+    def alignment_status(self) -> str:
+        role = self.source_url_role or "unknown"
+        fallback_roles = {
+            "fallback", "fallback_alternate_retailer", "marketplace_fallback", "global_fallback",
+            "alternate_retailer_same_country", "alternate_retailer_different_country",
+            "same_retailer_different_country", "different_retailer", "alternate_source",
+        }
+        primary_roles = {"primary", "primary_requested_retailer", "requested_retailer", "same_retailer_same_country"}
+        if role in primary_roles:
+            return "primary_requested_source"
+        if role in fallback_roles:
+            return "fallback_source_used"
+        if self.retailer_match is True and self.country_match is True:
+            return "primary_requested_source"
+        if self.retailer_match is False or self.country_match is False:
+            return "source_context_mismatch"
+        return "not_declared"
+
+    @property
+    def product_facts_transfer_allowed(self) -> bool:
+        # Product identity/fact claims may be used if evidence-grounded, even from
+        # a fallback URL, but must remain tagged by source axis.
+        return True
+
+    @property
+    def requested_retailer_claims_allowed(self) -> bool:
+        # Price/availability/delivery/seller claims must not be transferred from
+        # a fallback source to the requested retailer/country.
+        return self.alignment_status == "primary_requested_source"
+
+    @property
+    def source_specific_claim_scope(self) -> str:
+        return "requested_retailer_and_country" if self.requested_retailer_claims_allowed else "scraped_source_only"
+
+    def model_report(self) -> dict[str, Any]:
+        return {
+            "requested_context": {
+                "retailer_name": self.requested_retailer_name,
+                "country_code": self.requested_country_code,
+            },
+            "scraped_source": {
+                "product_url": self.product_url,
+                "retailer_name": self.source_retailer_name,
+                "country_code": self.source_country_code,
+                "source_url_role": self.source_url_role,
+            },
+            "alignment_status": self.alignment_status,
+            "retailer_match": self.retailer_match,
+            "country_match": self.country_match,
+            "product_facts_transfer_allowed": self.product_facts_transfer_allowed,
+            "requested_retailer_claims_allowed": self.requested_retailer_claims_allowed,
+            "source_specific_claim_scope": self.source_specific_claim_scope,
+            "policy": (
+                "Product-level facts can be used from the scraped source when evidence-grounded. "
+                "Retailer-specific claims such as price, availability, delivery, seller, and marketplace terms "
+                "are scoped only to the scraped source unless the source matches the requested retailer/country."
+            ),
+        }
+
 class ScrapeRequest(BaseModel):
     """Public input contract for the isolated product scraping agent.
 
@@ -129,8 +248,15 @@ class ScrapeRequest(BaseModel):
     # Optional user/business identifiers supplied with the product URL.
     main_text: str = ""
     ean: str = ""
-    retailer_name: str = ""
-    country_code: str = ""
+    retailer_name: str = ""  # backward-compatible alias for requested_retailer_name
+    country_code: str = ""    # backward-compatible alias for requested_country_code
+
+    # Explicit requested vs actual-source context. These are optional and generic.
+    requested_retailer_name: str = ""
+    requested_country_code: str = ""
+    source_retailer_name: str = ""
+    source_country_code: str = ""
+    source_url_role: str = "unknown"
 
     # Optional override for image/claims prompts. If omitted, it is derived from
     # main_text/EAN/retailer/country where available.
@@ -157,10 +283,16 @@ class ScrapeRequest(BaseModel):
     def normalize_ean(cls, value: str) -> str:
         return digits_only(value)
 
-    @field_validator("country_code")
+    @field_validator("country_code", "requested_country_code", "source_country_code")
     @classmethod
     def normalize_country(cls, value: str) -> str:
         return (value or "").strip().upper()
+
+    @field_validator("source_url_role")
+    @classmethod
+    def normalize_source_url_role(cls, value: str) -> str:
+        role = (value or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+        return role or "unknown"
 
     @model_validator(mode="after")
     def require_url(self) -> "ScrapeRequest":
@@ -170,11 +302,26 @@ class ScrapeRequest(BaseModel):
 
     @property
     def input_context(self) -> ProductInputContext:
+        requested_retailer = (self.requested_retailer_name or self.retailer_name or "").strip()
+        requested_country = (self.requested_country_code or self.country_code or "").strip().upper()
         return ProductInputContext(
             main_text=self.main_text.strip(),
             ean=self.ean.strip(),
-            retailer_name=self.retailer_name.strip(),
-            country_code=self.country_code.strip(),
+            retailer_name=requested_retailer,
+            country_code=requested_country,
+        )
+
+    @property
+    def source_alignment(self) -> SourceAlignmentContext:
+        requested_retailer = (self.requested_retailer_name or self.retailer_name or "").strip()
+        requested_country = (self.requested_country_code or self.country_code or "").strip().upper()
+        return SourceAlignmentContext(
+            product_url=self.product_url.strip(),
+            requested_retailer_name=requested_retailer,
+            requested_country_code=requested_country,
+            source_retailer_name=(self.source_retailer_name or "").strip(),
+            source_country_code=(self.source_country_code or "").strip().upper(),
+            source_url_role=(self.source_url_role or "unknown").strip(),
         )
 
     @property
@@ -251,6 +398,7 @@ class ScrapeResult(BaseModel):
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
+    source_alignment: SourceAlignmentContext = Field(default_factory=SourceAlignmentContext)
 
     request_json_path: Path | None = None
     scrape_result_json_path: Path | None = None
@@ -266,6 +414,7 @@ class ScrapeResult(BaseModel):
     noise_report_json_path: Path | None = None
     evidence_recovery_report_json_path: Path | None = None
     quality_report_json_path: Path | None = None
+    source_alignment_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -306,8 +455,10 @@ class ProductEvidence(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     product_focus_summary: str = ""
+    source_alignment: dict[str, Any] = Field(default_factory=dict)
     product_identity: dict[str, Any] = Field(default_factory=dict)
     retailer_claims: list[dict[str, Any]] = Field(default_factory=list)
+    source_specific_claims: list[dict[str, Any]] = Field(default_factory=list)
     product_only_text_blocks: list[dict[str, Any]] = Field(default_factory=list)
     structured_claims: list[dict[str, Any]] = Field(default_factory=list)
     table_claims: list[dict[str, Any]] = Field(default_factory=list)
@@ -344,6 +495,7 @@ class ScrapedProduct(BaseModel):
 
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
     upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
+    source_alignment: SourceAlignmentContext = Field(default_factory=SourceAlignmentContext)
 
     raw_markdown: str = ""
     raw_html: str = ""
@@ -366,6 +518,7 @@ class ScrapedProduct(BaseModel):
     noise_report_json_path: Path | None = None
     evidence_recovery_report_json_path: Path | None = None
     quality_report_json_path: Path | None = None
+    source_alignment_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -398,6 +551,7 @@ class ScrapedProduct(BaseModel):
             evidence_axes_used=self.evidence_axes_used,
             input_context=self.input_context,
             upstream_evidence=self.upstream_evidence,
+            source_alignment=self.source_alignment,
             request_json_path=self.request_json_path,
             scrape_result_json_path=self.scrape_result_json_path,
             source_md_path=self.source_md_path,
@@ -412,6 +566,7 @@ class ScrapedProduct(BaseModel):
             noise_report_json_path=self.noise_report_json_path,
             evidence_recovery_report_json_path=self.evidence_recovery_report_json_path,
             quality_report_json_path=self.quality_report_json_path,
+            source_alignment_report_json_path=self.source_alignment_report_json_path,
             agent_trace_json_path=self.agent_trace_json_path,
             raw_debug_dir=self.raw_debug_dir,
             image_count=len(self.images),
@@ -429,6 +584,7 @@ __all__ = [
     "ProductInputContext",
     "EvidenceSourceItem",
     "UpstreamEvidenceBundle",
+    "SourceAlignmentContext",
     "ScrapeRequest",
     "ScrapeResult",
     "ImageRef",

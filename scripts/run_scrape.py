@@ -17,8 +17,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scrape-id", default=None, help="Optional stable artifact id")
     parser.add_argument("--main-text", default="", help="Optional source product text / item description")
     parser.add_argument("--ean", default="", help="Optional EAN/GTIN")
-    parser.add_argument("--retailer-name", default="", help="Optional retailer name")
-    parser.add_argument("--country-code", default="", help="Optional ISO country code, e.g. CZ")
+    parser.add_argument("--retailer-name", default="", help="Backward-compatible alias for requested retailer name")
+    parser.add_argument("--country-code", default="", help="Backward-compatible alias for requested ISO country code, e.g. CZ")
+    parser.add_argument("--requested-retailer-name", default="", help="Original target/requested retailer name")
+    parser.add_argument("--requested-country-code", default="", help="Original target/requested ISO country code")
+    parser.add_argument("--source-retailer-name", default="", help="Actual retailer/source represented by --url, if known")
+    parser.add_argument("--source-country-code", default="", help="Actual country/market of --url, if known")
+    parser.add_argument("--source-url-role", default="unknown", help="Role of --url: primary_requested_retailer, alternate_retailer_same_country, alternate_retailer_different_country, same_retailer_different_country, marketplace_fallback, global_fallback, unknown")
     parser.add_argument("--product-hint", default="", help="Optional override for image/claims prompt context")
     parser.add_argument("--upstream-ai-evidence", default="", help="Optional already-produced AI/search evidence text; no search is performed")
     parser.add_argument("--upstream-ai-evidence-file", default="", help="Optional text/markdown file containing upstream AI/search evidence")
@@ -68,6 +73,11 @@ async def main() -> None:
             ean=args.ean,
             retailer_name=args.retailer_name,
             country_code=args.country_code,
+            requested_retailer_name=args.requested_retailer_name,
+            requested_country_code=args.requested_country_code,
+            source_retailer_name=args.source_retailer_name,
+            source_country_code=args.source_country_code,
+            source_url_role=args.source_url_role,
             product_hint=args.product_hint,
             upstream_ai_evidence=_load_ai_evidence(args),
             candidate_snippets=args.candidate_snippet or [],
@@ -90,6 +100,9 @@ async def main() -> None:
     print(f"claims_md: {result.claims_md_path}")
     print(f"evidence_recovery_report: {result.evidence_recovery_report_json_path}")
     print(f"quality_report: {result.quality_report_json_path}")
+    print(f"source_alignment_report: {result.source_alignment_report_json_path}")
+    print(f"source_alignment: {result.source_alignment.alignment_status}")
+    print(f"source_claim_scope: {result.source_alignment.source_specific_claim_scope}")
     print(f"browser_visible: {result.browser_visible}")
     print(f"product_details_recovered: {result.product_details_recovered}")
     print(f"recovery_status: {result.recovery_status}")
