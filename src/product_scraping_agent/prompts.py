@@ -34,7 +34,8 @@ class P:
             "action set: stop, full_page_scroll, expand_common_sections, extract_gallery_sources, "
             "retry_relaxed. Choose follow-up actions only when they are needed to capture "
             "missing product facts, hidden specifications, gallery images, tabs/accordions, "
-            "or lazy-loaded content. Return strict JSON only."
+            "or lazy-loaded content. Product URL is the primary input; optional context is only for trace, validation, and routing. "
+            "Return strict JSON only."
         ),
     )
 
@@ -45,10 +46,12 @@ class P:
             "The artifact must be noise-free: exclude navigation, cookie text, delivery boilerplate, "
             "recommendation carousels, ads, unrelated products, footer text, and generic site policy text. "
             "Use only the supplied evidence. Do not invent facts and do not use external knowledge. "
-            "Every material product claim must carry evidence-axis tags: T=rendered product text, "
-            "V=visual evidence, S=structured metadata/JSON-LD/meta tags, D=HTML tables, I=user input context. "
-            "User input context is provenance only; never promote it as a retailer claim unless the same "
-            "claim is also supported by T, V, S, or D. Report gaps and discrepancies explicitly. "
+            "Every material product claim must carry evidence-axis tags: B=direct browser-rendered page, "
+            "P=proxy/target-country rendered page, T=rendered product text, V=visual evidence, "
+            "S=structured metadata/meta tags, J=JSON-LD, D=HTML tables, A=caller-supplied upstream indexed/search/AI evidence, "
+            "I=user input context. Product URL is the primary anchor. User input context is provenance and validation only; "
+            "never promote it as a retailer claim unless supported by B, P, T, V, S, J, D, or A. "
+            "Report gaps and discrepancies explicitly. "
             "Return strict JSON only, matching the requested schema."
         ),
     )

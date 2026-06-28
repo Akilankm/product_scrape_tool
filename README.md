@@ -4,17 +4,47 @@ A clean, isolated **product URL → product-only retailer evidence artifact** ag
 
 This repo intentionally contains only product scraping runtime code. It does **not** contain URL search/discovery, product coding, reporting spreadsheets, Streamlit UI, Docker search infrastructure, or rulebook logic.
 
+
+## Install modes
+
+### Core scraper install — recommended first
+
+Use this when you only want the product scraping agent runtime. This does **not** install notebook dependencies, so it avoids the `ipykernel -> IPython -> jedi` chain.
+
+```bash
+pdm install --prod
+```
+
+### Notebook install — optional
+
+Install this only when you want to run `notebooks/run_single_url_scrape.ipynb`.
+
+```bash
+pdm install -G notebook
+```
+
+### Test install — optional
+
+```bash
+pdm install -G test
+pdm run pytest
+```
+
+If install hangs at `jedi`, it is almost always from the notebook dependency chain, not the core scraper. Use `pdm install --prod` for the scraper-only runtime.
+
 ## Contract
 
 ```text
 INPUT   : product_url
 OPTIONAL: main_text, ean, retailer_name, country_code, product_hint
+OPTIONAL ROUTING: proxy_url, proxy_country_code, enable_proxy_retry
+OPTIONAL RECOVERY EVIDENCE: upstream_ai_evidence, candidate_snippets, search_evidence
 OUTPUT  : noise-free product evidence artifact folder
 ```
 
-The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
+The URL is the primary anchor. Optional fields are supporting context for decision trace, validation, image relevance, locale/proxy routing, and evidence normalization. They never trigger search and are not treated as retailer truth unless supported by captured evidence.
 
-## What changed in v3
+## What changed in v1.1.5
 
 The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 
@@ -29,9 +59,11 @@ The scraper is now an **agentic evidence builder**, not a one-pass page dump:
 4. Images are downloaded, deduplicated, relevance-gated, and vision-described
 5. LLM normalizer creates product-only evidence JSON/Markdown
 6. claims.md is generated only from normalized product evidence
+7. If browser access is blocked/weak, Evidence Recovery Mode can use caller-supplied upstream AI/search evidence without performing search itself
+8. The artifact records `url_analysis`, `supporting_context_assessment`, `proxy_plan`, and planner decisions in the trace
 ```
 
-No web search is performed. No external facts are used. No guesses are allowed.
+No web search is performed inside this scraper. No external facts are used unless the caller supplies them as upstream evidence, and those claims are explicitly tagged with `A` evidence axis. No guesses are allowed.
 
 ## Install
 
@@ -63,9 +95,18 @@ result = await ProductScrapingAgent().scrape(
         main_text="LEGO DUPLO 10965 Bath Time Fun",
         ean="5702017153647",
         retailer_name="Example Retailer",
-        country_code="CZ",
+        country_code="CZ",          # supporting routing/trace context
         output_root=Path("data/scraped"),
         max_agent_iterations=2,
+
+        # Optional: pass evidence already produced by search/discovery.
+        # The scraper will not search; it only uses this as A-axis recovery evidence.
+        upstream_ai_evidence="SerpAPI AI Mode / indexed evidence text here",
+        candidate_snippets=["Retailer indexed snippet here"],
+
+        # Optional proxy controls. Proxy routing is native; endpoint credentials stay external.
+        # proxy_url="http://user:pass@cz-proxy.example:8080",
+        # proxy_country_code="CZ",
     )
 )
 
@@ -85,6 +126,10 @@ pdm run python scripts/run_scrape.py \
   --retailer-name "Example Retailer" \
   --country-code "CZ" \
   --max-agent-iterations 2 \
+  --proxy-country-code "CZ" \
+  --upstream-ai-evidence-file evidence/ai_mode.txt \
+  --candidate-snippet "Indexed retailer snippet..." \
+  --search-evidence-json evidence/search_evidence.json \
   --output-root data/scraped
 ```
 
@@ -110,6 +155,7 @@ data/scraped/<scrape_id>/
     ├── vision.md                      # retained product image observations
     ├── metadata.json                  # structured page metadata and capture counts
     ├── noise_report.json              # confirms noisy page/site content was excluded
+    ├── evidence_recovery_report.json  # browser/proxy/upstream evidence recovery audit
     ├── tables/
     │   ├── table_001.md
     │   └── ...
@@ -137,22 +183,27 @@ Use these files first:
 | `claims.md` | Final grounded claim narrative generated from normalized evidence only. |
 | `source.md` | Product-only text blocks retained from retailer evidence. Not raw noisy page text. |
 | `vision.md` | Product-relevant image observations. |
-| `metadata.json` | Canonical URL, title, JSON-LD, OG/product metadata, capture counts. |
+| `metadata.json` | URL analysis, proxy plan, canonical URL, title, JSON-LD, OG/product metadata, capture counts. |
+| `evidence_recovery_report.json` | Explains whether the browser saw the page, whether product details were recovered, and which evidence sources were used. |
 | `tables/` | HTML tables converted to Markdown for spec evidence. |
 | `images/` | Downloaded product images retained by relevance filtering. |
-| `manifests/agent_trace.json` | LLM planner decisions and same-page iterative scrape actions. |
+| `manifests/agent_trace.json` | URL-first analysis, supporting-context assessment, LLM planner decisions, and same-page iterative scrape actions. |
 
 ## Evidence axes
 
 ```text
+B = directly browser-rendered page
+P = proxy/target-country rendered page
 T = product text from rendered page
 V = product image / packaging visual evidence
-S = structured metadata / JSON-LD / meta tags
+S = structured metadata / meta tags
+J = JSON-LD product data
 D = HTML tables
+A = caller-supplied upstream indexed/search/AI evidence
 I = user-provided input context: main_text, EAN, retailer, country
 ```
 
-`I` is provenance only. The normalizer is instructed not to treat input context as a retailer claim unless it is also supported by `T`, `V`, `S`, or `D`.
+`I` is provenance only. The normalizer is instructed not to treat input context as a retailer claim unless it is also supported by `B`, `P`, `T`, `V`, `S`, `J`, `D`, or `A`. `A` is used only when the caller passes upstream evidence; the scraper itself does not search.
 
 ## Runtime settings
 
@@ -166,6 +217,10 @@ PCA_WRITE_RAW_DEBUG=false
 PCA_LLM_ENABLED=true
 PCA_LLM_VISION_ENABLED=true
 PCA_SCAN_FULL_PAGE=false
+PCA_EVIDENCE_RECOVERY_MODE=true
+PCA_GEO_RETRY_ON_ACCESS_BLOCK=true
+PCA_PROXY_URL_CZ=
+PCA_ACCEPT_LANGUAGE_CZ=
 ```
 
 ## Package structure
@@ -175,6 +230,8 @@ src/product_scraping_agent/
 ├── agent.py          # Public ProductScrapingAgent API
 ├── pipeline.py       # Agentic URL → product-only artifact orchestration
 ├── agentic.py        # LLM planning + product-only normalization
+├── url_analysis.py   # URL decomposition and supporting-context assessment
+├── proxy_router.py   # Native same-URL proxy/locale routing plan
 ├── full_scraper.py   # Crawl4AI rendering + follow-up profiles + HTML extraction
 ├── images.py         # Image download, dedupe, relevance, vision notes
 ├── models.py         # ScrapeRequest, ScrapeResult, ProductEvidence, ImageRef, TableRef
@@ -200,4 +257,71 @@ Streamlit UI
 database/search services
 SearXNG/SerpAPI code
 rulebook/API coding logic
+```
+
+## Geo/access restrictions
+
+Some retailer product URLs may exist but be inaccessible from the runtime geography, for example from India or from a locked-down Azure region. The scraper now treats this as an **access-status problem**, not as product absence.
+
+The artifact records:
+
+```text
+access_status
+access_issue_type
+access_issue_reason
+geo_restricted
+proxy_used
+proxy_source
+access_attempts
+```
+
+Proxy retry orchestration is built in. If you have an authorised target-country proxy/VPN egress, configure only the endpoint/credentials in `.env`, YAML, request override, or a secret-injected environment variable:
+
+```env
+PCA_GEO_RETRY_ON_ACCESS_BLOCK=true
+PCA_PROXY_URL_CZ=http://user:pass@cz-proxy.example:8080
+PCA_ACCEPT_LANGUAGE_CZ=cs-CZ,cs;q=0.9,en;q=0.7
+```
+
+The agent resolves the proxy target from this priority order:
+
+```text
+1. request.proxy_country_code
+2. request.country_code
+3. URL country hint from the domain
+```
+
+Without a configured proxy endpoint, a geo/access-blocked page produces an artifact with `access_status` such as `geo_restricted`, `access_denied`, or `bot_challenge`. It will **not** claim that the product is missing. If upstream AI/search evidence is supplied by the caller, the agent can still build a recovered product evidence artifact and tag those claims as `A` axis.
+
+## Evidence Recovery Mode
+
+This mode addresses the case where the product page exists, but the runtime browser cannot see it because of geography, anti-bot, or retailer access policy. The scraper still does not search. It can consume evidence already produced upstream:
+
+```python
+ScrapeRequest(
+    product_url="https://retailer.example/product/123",
+    main_text="Toy name from input CSV",
+    ean="1234567890123",
+    country_code="CO",
+    upstream_ai_evidence="AI Mode / indexed evidence already obtained by discovery",
+    candidate_snippets=["Indexed snippet from search result"],
+    search_evidence=[
+        {
+            "source_type": "serp",
+            "title": "Retailer product result",
+            "url": "https://retailer.example/product/123",
+            "text": "Indexed snippet text"
+        }
+    ],
+)
+```
+
+The artifact records:
+
+```text
+browser_visible
+product_details_recovered
+recovery_status
+evidence_axes_used
+evidence_recovery_report.json
 ```

@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .text_utils import digits_only
+from .url_analysis import URLAnalysis
 
 _DTO_CONFIG = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -58,6 +59,61 @@ class ProductInputContext(BaseModel):
         return " | ".join(parts) or fallback
 
 
+class EvidenceSourceItem(BaseModel):
+    """Optional upstream evidence already produced by the search/discovery layer.
+
+    The scraping agent does not perform search. These items are only consumed
+    when the caller passes them in, for example SerpAPI snippets, AI Mode
+    answers, cached/indexed snippets, or manually supplied discovery evidence.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    source_type: str = "upstream"
+    title: str = ""
+    url: str = ""
+    text: str = ""
+    evidence_id: str = ""
+    confidence: str = ""
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpstreamEvidenceBundle(BaseModel):
+    """Search/discovery evidence handed to the scraper by the caller.
+
+    This is not a search feature. It is an evidence recovery input. It lets the
+    scraper build a grounded product artifact when browser rendering is blocked
+    or weak, while still tagging those claims as upstream/indexed evidence.
+    """
+
+    model_config = _DTO_CONFIG
+
+    ai_mode_evidence: str = ""
+    candidate_snippets: list[str] = Field(default_factory=list)
+    search_evidence: list[EvidenceSourceItem] = Field(default_factory=list)
+    notes: str = ""
+
+    def has_any(self) -> bool:
+        return bool(
+            (self.ai_mode_evidence or "").strip()
+            or any((x or "").strip() for x in self.candidate_snippets)
+            or any((item.text or item.title or item.url or item.raw) for item in self.search_evidence)
+            or (self.notes or "").strip()
+        )
+
+    def compact(self, *, max_chars: int = 60_000) -> dict[str, Any]:
+        data = self.model_dump()
+        # Keep the payload bounded before sending to the LLM.
+        if len(data.get("ai_mode_evidence") or "") > max_chars:
+            data["ai_mode_evidence"] = data["ai_mode_evidence"][:max_chars] + "... [truncated]"
+        data["candidate_snippets"] = [
+            s[:8_000] + ("... [truncated]" if len(s) > 8_000 else "")
+            for s in data.get("candidate_snippets", [])[:20]
+        ]
+        data["search_evidence"] = data.get("search_evidence", [])[:50]
+        return data
+
+
 class ScrapeRequest(BaseModel):
     """Public input contract for the isolated product scraping agent.
 
@@ -81,6 +137,14 @@ class ScrapeRequest(BaseModel):
     # main_text/EAN/retailer/country where available.
     product_hint: str = ""
 
+    # Optional evidence from the already-completed search/discovery layer.
+    # The scraper never performs search; it only consumes these as grounded
+    # recovery evidence when browser access is weak/blocked.
+    upstream_ai_evidence: str = ""
+    candidate_snippets: list[str] = Field(default_factory=list)
+    search_evidence: list[EvidenceSourceItem] = Field(default_factory=list)
+    upstream_evidence_notes: str = ""
+
     output_root: Path | None = None
     retailer_label: str = "retailer"
     max_images: int = 30
@@ -89,12 +153,18 @@ class ScrapeRequest(BaseModel):
     strict_product_only: bool = True
     write_raw_debug: bool | None = None
 
+    # Native proxy routing controls. The proxy mechanism is built in, but actual
+    # endpoint/credentials must come from request/env/YAML/secret injection.
+    proxy_url: str = ""
+    proxy_country_code: str = ""
+    enable_proxy_retry: bool = True
+
     @field_validator("ean")
     @classmethod
     def normalize_ean(cls, value: str) -> str:
         return digits_only(value)
 
-    @field_validator("country_code")
+    @field_validator("country_code", "proxy_country_code")
     @classmethod
     def normalize_country(cls, value: str) -> str:
         return (value or "").strip().upper()
@@ -112,6 +182,15 @@ class ScrapeRequest(BaseModel):
             ean=self.ean.strip(),
             retailer_name=self.retailer_name.strip(),
             country_code=self.country_code.strip(),
+        )
+
+    @property
+    def upstream_evidence(self) -> UpstreamEvidenceBundle:
+        return UpstreamEvidenceBundle(
+            ai_mode_evidence=(self.upstream_ai_evidence or "").strip(),
+            candidate_snippets=[s.strip() for s in self.candidate_snippets if (s or "").strip()],
+            search_evidence=self.search_evidence,
+            notes=(self.upstream_evidence_notes or "").strip(),
         )
 
     def resolved_product_hint(self) -> str:
@@ -162,7 +241,23 @@ class ScrapeResult(BaseModel):
     title: str = ""
     output_dir: Path | None = None
 
+    access_status: str = "unknown"
+    access_issue_type: str = ""
+    access_issue_reason: str = ""
+    geo_restricted: bool = False
+    proxy_used: bool = False
+    proxy_source: str = ""
+    access_attempts: list[dict[str, Any]] = Field(default_factory=list)
+
+    browser_visible: bool = False
+    product_details_recovered: bool = False
+    recovery_status: str = "not_evaluated"
+    evidence_axes_used: list[str] = Field(default_factory=list)
+
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
+    upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
+    url_analysis: URLAnalysis | None = None
+    proxy_plan: dict[str, Any] = Field(default_factory=dict)
 
     request_json_path: Path | None = None
     scrape_result_json_path: Path | None = None
@@ -176,6 +271,7 @@ class ScrapeResult(BaseModel):
     product_evidence_md_path: Path | None = None
     product_evidence_json_path: Path | None = None
     noise_report_json_path: Path | None = None
+    evidence_recovery_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -238,7 +334,24 @@ class ScrapedProduct(BaseModel):
     final_url: str = ""
     title: str = ""
     output_dir: Path | None = None
+
+    access_status: str = "unknown"
+    access_issue_type: str = ""
+    access_issue_reason: str = ""
+    geo_restricted: bool = False
+    proxy_used: bool = False
+    proxy_source: str = ""
+    access_attempts: list[dict[str, Any]] = Field(default_factory=list)
+
+    browser_visible: bool = False
+    product_details_recovered: bool = False
+    recovery_status: str = "not_evaluated"
+    evidence_axes_used: list[str] = Field(default_factory=list)
+
     input_context: ProductInputContext = Field(default_factory=ProductInputContext)
+    upstream_evidence: UpstreamEvidenceBundle = Field(default_factory=UpstreamEvidenceBundle)
+    url_analysis: URLAnalysis | None = None
+    proxy_plan: dict[str, Any] = Field(default_factory=dict)
 
     raw_markdown: str = ""
     raw_html: str = ""
@@ -259,6 +372,7 @@ class ScrapedProduct(BaseModel):
     product_evidence_md_path: Path | None = None
     product_evidence_json_path: Path | None = None
     noise_report_json_path: Path | None = None
+    evidence_recovery_report_json_path: Path | None = None
     agent_trace_json_path: Path | None = None
     raw_debug_dir: Path | None = None
 
@@ -278,7 +392,21 @@ class ScrapedProduct(BaseModel):
             final_url=self.final_url,
             title=self.title,
             output_dir=self.output_dir,
+            access_status=self.access_status,
+            access_issue_type=self.access_issue_type,
+            access_issue_reason=self.access_issue_reason,
+            geo_restricted=self.geo_restricted,
+            proxy_used=self.proxy_used,
+            proxy_source=self.proxy_source,
+            access_attempts=self.access_attempts,
+            browser_visible=self.browser_visible,
+            product_details_recovered=self.product_details_recovered,
+            recovery_status=self.recovery_status,
+            evidence_axes_used=self.evidence_axes_used,
             input_context=self.input_context,
+            upstream_evidence=self.upstream_evidence,
+            url_analysis=self.url_analysis,
+            proxy_plan=self.proxy_plan,
             request_json_path=self.request_json_path,
             scrape_result_json_path=self.scrape_result_json_path,
             source_md_path=self.source_md_path,
@@ -291,6 +419,7 @@ class ScrapedProduct(BaseModel):
             product_evidence_md_path=self.product_evidence_md_path,
             product_evidence_json_path=self.product_evidence_json_path,
             noise_report_json_path=self.noise_report_json_path,
+            evidence_recovery_report_json_path=self.evidence_recovery_report_json_path,
             agent_trace_json_path=self.agent_trace_json_path,
             raw_debug_dir=self.raw_debug_dir,
             image_count=len(self.images),
@@ -306,6 +435,9 @@ class ScrapedProduct(BaseModel):
 
 __all__ = [
     "ProductInputContext",
+    "URLAnalysis",
+    "EvidenceSourceItem",
+    "UpstreamEvidenceBundle",
     "ScrapeRequest",
     "ScrapeResult",
     "ImageRef",

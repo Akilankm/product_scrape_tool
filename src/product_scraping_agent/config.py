@@ -42,6 +42,13 @@ class Config:
     scrape_timeout: float = _env_float("SCRAPE_TIMEOUT", 35.0)
     scrape_wait_until: str = _env("SCRAPE_WAIT_UNTIL", "domcontentloaded")
 
+    # Geo/access handling. The scraper never treats geo/access blocks as product absence.
+    # Configure authorised proxy/VPN egress explicitly when target-country access is required.
+    geo_proxy_enabled: bool = _env_bool("GEO_PROXY_ENABLED", False)
+    geo_retry_on_access_block: bool = _env_bool("GEO_RETRY_ON_ACCESS_BLOCK", True)
+    default_proxy_url: str = _env("PROXY_URL", "")
+    accept_language: str = _env("ACCEPT_LANGUAGE", "")
+
     # Agentic evidence-building loop.
     agentic_enabled: bool = _env_bool("AGENTIC_ENABLED", True)
     agentic_max_iterations: int = _env_int("AGENTIC_MAX_ITERATIONS", 2)
@@ -69,3 +76,34 @@ class Config:
 
 def get_config() -> Config:
     return Config()
+
+
+def proxy_url_for_country(country_code: str = "") -> str:
+    """Return configured proxy URL for a target country, falling back to PCA_PROXY_URL.
+
+    Examples:
+        PCA_PROXY_URL_CZ=http://user:pass@cz-proxy:8080
+        PCA_PROXY_URL=http://user:pass@generic-proxy:8080
+    """
+    cc = (country_code or "").strip().upper()
+    if cc:
+        country_proxy = os.getenv(f"{_PREFIX}PROXY_URL_{cc}", "").strip()
+        if country_proxy:
+            return country_proxy
+    return os.getenv(f"{_PREFIX}PROXY_URL", "").strip()
+
+
+def accept_language_for_country(country_code: str = "") -> str:
+    """Return configured Accept-Language for target country.
+
+    The agent avoids hard-coded locale assumptions. Configure either:
+        PCA_ACCEPT_LANGUAGE_CZ=cs-CZ,cs;q=0.9,en;q=0.7
+    or:
+        PCA_ACCEPT_LANGUAGE=en-US,en;q=0.9
+    """
+    cc = (country_code or "").strip().upper()
+    if cc:
+        value = os.getenv(f"{_PREFIX}ACCEPT_LANGUAGE_{cc}", "").strip()
+        if value:
+            return value
+    return os.getenv(f"{_PREFIX}ACCEPT_LANGUAGE", "").strip()

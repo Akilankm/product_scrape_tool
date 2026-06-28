@@ -18,6 +18,9 @@ from urllib.parse import urljoin
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Config
+from .models import ProductInputContext
+from .proxy_router import ProxyPlan, resolve_proxy_plan
+from .url_analysis import URLAnalysis, analyze_product_url
 from .log import logger
 from .services.scraper import (
     _CANONICAL_RE,
@@ -38,6 +41,44 @@ _CSS_URL_RE = re.compile(r"url\((['\"]?)(.*?)\1\)", re.I)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
+_ACCESS_BLOCK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("geo_restricted", re.compile(r"\b(not available|unavailable|blocked|restricted)\b.{0,80}\b(country|region|location|territory|area|geo)", re.I)),
+    ("geo_restricted", re.compile(r"\b(country|region|location|territory|area|geo)\b.{0,80}\b(not supported|not allowed|not available|blocked|restricted)", re.I)),
+    ("access_denied", re.compile(r"\b(access denied|forbidden|request blocked|you don't have permission|permission denied)\b", re.I)),
+    ("bot_challenge", re.compile(r"\b(captcha|cloudflare|verify you are human|checking your browser|robot check|bot protection)\b", re.I)),
+    ("rate_limited", re.compile(r"\b(too many requests|rate limit|temporarily blocked)\b", re.I)),
+)
+
+
+def _classify_access_issue(status: int, html: str = "", markdown: str = "", error: str = "") -> tuple[str, str, bool]:
+    """Classify access failures without claiming product absence."""
+    text = "\n".join([error or "", markdown or "", html or ""])[:80_000]
+    if status == 451:
+        return "geo_restricted", "HTTP 451 legal/geographic restriction", True
+    if status in {401, 403}:
+        # 403 can be geo, anti-bot, or auth; inspect text before choosing.
+        for issue_type, pattern in _ACCESS_BLOCK_PATTERNS:
+            if pattern.search(text):
+                return issue_type, f"HTTP {status} with {issue_type} indicators", issue_type == "geo_restricted"
+        return "access_denied", f"HTTP {status} access denied", False
+    if status == 429:
+        return "rate_limited", "HTTP 429 rate limited", False
+    if 500 <= status < 600:
+        return "server_error", f"HTTP {status} server error", False
+    for issue_type, pattern in _ACCESS_BLOCK_PATTERNS:
+        if pattern.search(text):
+            return issue_type, f"page text contains {issue_type} indicators", issue_type == "geo_restricted"
+    if error and not (html or markdown):
+        return "fetch_error", error[:300], False
+    return "none", "", False
+
+
+def _proxy_label(proxy_url: str, country_code: str = "") -> str:
+    if not proxy_url:
+        return "direct"
+    cc = (country_code or "").strip().upper()
+    return f"configured_country_proxy:{cc}" if cc else "configured_proxy"
+
 class FullPage(BaseModel):
     """Rendered page payload and extracted browser-level signals."""
 
@@ -49,6 +90,13 @@ class FullPage(BaseModel):
     success: bool = False
     status: int = 0
     error: str = ""
+    access_status: str = "unknown"
+    access_issue_type: str = ""
+    access_issue_reason: str = ""
+    geo_restricted: bool = False
+    proxy_used: bool = False
+    proxy_source: str = ""
+    access_attempts: list[dict[str, object]] = Field(default_factory=list)
     title: str = ""
     description: str = ""
     canonical_url: str = ""
@@ -155,6 +203,82 @@ class _Walker(HTMLParser):
         return "<" + " ".join(parts) + ">"
 
 
+
+
+def _coerce_text(value, *, max_chars: int | None = None, _depth: int = 0) -> str:
+    """Return plain text from Crawl4AI/Pydantic result variants.
+
+    Crawl4AI changed markdown payload shapes across versions. In some versions
+    ``result.markdown`` is already a string; in others it is a
+    MarkdownGenerationResult object containing fields such as raw_markdown,
+    fit_markdown, markdown, or text. This helper recursively normalizes those
+    shapes so the rest of the scraper can safely treat page text/html as str.
+    """
+    if value is None or _depth > 5:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, (int, float, bool)):
+        text = str(value)
+    elif isinstance(value, dict):
+        text = ""
+        for key in (
+            "raw_markdown",
+            "fit_markdown",
+            "markdown",
+            "markdown_with_citations",
+            "text",
+            "content",
+            "cleaned_html",
+            "html",
+        ):
+            if key in value:
+                text = _coerce_text(value.get(key), max_chars=max_chars, _depth=_depth + 1)
+                if text:
+                    break
+    elif isinstance(value, (list, tuple)):
+        parts = [_coerce_text(v, _depth=_depth + 1) for v in value]
+        text = "\n".join(p for p in parts if p)
+    else:
+        text = ""
+        for attr in (
+            "raw_markdown",
+            "fit_markdown",
+            "markdown",
+            "markdown_with_citations",
+            "text",
+            "content",
+            "cleaned_html",
+            "html",
+        ):
+            try:
+                nested = getattr(value, attr)
+            except Exception:
+                continue
+            if nested is value:
+                continue
+            text = _coerce_text(nested, max_chars=max_chars, _depth=_depth + 1)
+            if text:
+                break
+        if not text:
+            try:
+                dumped = value.model_dump()  # pydantic v2 models
+            except Exception:
+                dumped = None
+            if isinstance(dumped, dict):
+                text = _coerce_text(dumped, max_chars=max_chars, _depth=_depth + 1)
+        if not text:
+            # Last resort: keep the scraper alive, but avoid noisy object reprs
+            # unless the object actually renders to useful text.
+            rendered = str(value)
+            if "MarkdownGenerationResult" not in rendered and not rendered.startswith("<"):
+                text = rendered
+    text = text or ""
+    return text[:max_chars] if max_chars and len(text) > max_chars else text
+
+
 def _extract_head_meta(html: str) -> dict[str, object]:
     out: dict[str, object] = {
         "og": {},
@@ -232,7 +356,17 @@ def _profile_js(profile: str) -> str | None:
 """
 
 
-async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> FullPage:
+async def fetch_full(
+    cfg: Config,
+    url: str,
+    *,
+    profile: str = "standard",
+    country_code: str = "",
+    url_analysis: URLAnalysis | None = None,
+    proxy_url: str = "",
+    proxy_country_code: str = "",
+    enable_proxy_retry: bool = True,
+) -> FullPage:
     """Render a product URL with Crawl4AI and extract text/html/images/tables."""
     try:
         from crawl4ai import CacheMode
@@ -243,7 +377,19 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> Ful
     env_scan_full = os.getenv("PCA_SCAN_FULL_PAGE", "0").lower() in {"1", "true", "yes"}
     scan_full = env_scan_full or profile in {"full_page_scroll", "expand_common_sections", "extract_gallery_sources"}
 
-    def _mk_run_cfg(timeout_ms: int, *, last_ditch: bool = False):
+    analysis = url_analysis or analyze_product_url(url, country_code=country_code)
+    input_context = ProductInputContext(country_code=country_code)
+    proxy_plan: ProxyPlan = resolve_proxy_plan(
+        cfg,
+        url_analysis=analysis,
+        input_context=input_context,
+        proxy_url_override=proxy_url,
+        proxy_country_code=proxy_country_code,
+        enable_proxy_retry=enable_proxy_retry,
+    )
+    target_country_code = proxy_plan.target_country_code or (country_code or "").strip().upper()
+
+    def _mk_run_cfg(timeout_ms: int, *, last_ditch: bool = False, proxy_url: str = ""):
         kwargs = {
             "cache_mode": CacheMode.BYPASS,
             "page_timeout": timeout_ms,
@@ -256,17 +402,21 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> Ful
             "scan_full_page": False if last_ditch else scan_full,
             "screenshot": False,
         }
+        if proxy_url:
+            kwargs["proxy_config"] = proxy_url
+        if proxy_plan.accept_language:
+            kwargs["headers"] = {"Accept-Language": proxy_plan.accept_language}
         js = _profile_js(profile)
         if js and not last_ditch:
             kwargs["js_code"] = js
         return _crawler_config_kwargs(kwargs)
 
-    async def _attempt(timeout_ms: int, *, last_ditch: bool = False):
+    async def _attempt(timeout_ms: int, *, last_ditch: bool = False, proxy_url: str = ""):
         try:
             return await _crawler_arun_many(
                 cfg,
                 [url],
-                _mk_run_cfg(timeout_ms, last_ditch=last_ditch),
+                _mk_run_cfg(timeout_ms, last_ditch=last_ditch, proxy_url=proxy_url),
                 timeout=(timeout_ms / 1000.0) * 1.8,
             )
         except asyncio.TimeoutError:
@@ -276,36 +426,99 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> Ful
             logger.warning("full_scraper[{}]: crawl failed for {} — {}", profile, url, exc)
             return []
 
-    results = await _attempt(base_timeout_ms if profile == "standard" else int(base_timeout_ms * 1.6))
-    result = results[0] if results else None
+    access_attempts: list[dict[str, object]] = []
+
+    def _result_texts(r) -> tuple[int, str, str, str, bool]:
+        if r is None:
+            return 0, "", "", "no crawl result", False
+        status = int(getattr(r, "status_code", 0) or 0)
+        md_text = _coerce_text(getattr(r, "markdown", None)) or _coerce_text(getattr(r, "raw_markdown", None)) or _coerce_text(getattr(r, "fit_markdown", None))
+        html_text = _coerce_text(getattr(r, "cleaned_html", None)) or _coerce_text(getattr(r, "html", None))
+        error_text = str(getattr(r, "error_message", "") or "")
+        success = bool(getattr(r, "success", False))
+        return status, html_text, md_text, error_text, success
 
     def _transient(r) -> bool:
         if r is None:
             return True
-        status = int(getattr(r, "status_code", 0) or 0)
+        status, html_text, md_text, _error, success = _result_texts(r)
         if status in {401, 403, 408, 429, 451} or 500 <= status < 600:
             return True
-        if not bool(getattr(r, "success", False)):
-            md_obj = getattr(r, "markdown", None)
-            md_text = md_obj if isinstance(md_obj, str) else (getattr(md_obj, "raw_markdown", "") if md_obj else "")
-            if not (getattr(r, "cleaned_html", "") or getattr(r, "html", "") or md_text):
-                return True
+        if not success and not (html_text or md_text):
+            return True
         return False
+
+    def _append_attempt(name: str, r, *, proxy_url: str = "") -> None:
+        status, html_text, md_text, error_text, success = _result_texts(r)
+        issue_type, reason, is_geo = _classify_access_issue(status, html_text, md_text, error_text)
+        access_attempts.append({
+            "attempt": name,
+            "profile": profile,
+            "proxy_used": bool(proxy_url),
+            "proxy_source": proxy_plan.proxy_source if proxy_url else "direct",
+            "target_country_code": target_country_code,
+            "accept_language": proxy_plan.accept_language,
+            "url_country_hint": analysis.url_country_hint,
+            "status": status,
+            "success": success,
+            "html_chars": len(html_text or ""),
+            "markdown_chars": len(md_text or ""),
+            "access_issue_type": issue_type,
+            "access_issue_reason": reason,
+            "geo_restricted": is_geo,
+        })
+
+    direct_timeout = base_timeout_ms if profile == "standard" else int(base_timeout_ms * 1.6)
+    results = await _attempt(direct_timeout)
+    result = results[0] if results else None
+    _append_attempt("direct_initial", result)
 
     if _transient(result):
         logger.warning("full_scraper[{}]: retrying transient fetch for {}", profile, url)
         results = await _attempt(base_timeout_ms * 2)
-        result = results[0] if results else result
+        retry_result = results[0] if results else None
+        _append_attempt("direct_retry", retry_result)
+        result = retry_result or result
+
+    # Geo/access-aware escalation: direct failure must not be interpreted as product absence.
+    status, html_text, md_text, error_text, _success = _result_texts(result)
+    issue_type, reason, is_geo = _classify_access_issue(status, html_text, md_text, error_text)
+    routed_proxy_url = proxy_plan.proxy_url if proxy_plan.enabled else ""
+    should_proxy_retry = (
+        cfg.geo_retry_on_access_block
+        and proxy_plan.enabled
+        and bool(routed_proxy_url)
+        and issue_type in {"geo_restricted", "access_denied", "bot_challenge", "rate_limited", "fetch_error"}
+    )
+    if should_proxy_retry:
+        logger.warning(
+            "full_scraper[{}]: access issue detected ({}); retrying with configured target-country proxy ({})",
+            profile, issue_type, proxy_plan.proxy_source,
+        )
+        results = await _attempt(base_timeout_ms * 2, proxy_url=routed_proxy_url)
+        proxy_result = results[0] if results else None
+        _append_attempt("geo_proxy_retry", proxy_result, proxy_url=routed_proxy_url)
+        p_status, p_html, p_md, p_error, p_success = _result_texts(proxy_result)
+        p_issue, _p_reason, _p_geo = _classify_access_issue(p_status, p_html, p_md, p_error)
+        if proxy_result is not None and (p_success or p_html or p_md) and p_issue not in {"geo_restricted", "access_denied", "bot_challenge"}:
+            result = proxy_result
 
     if _transient(result) or profile == "retry_relaxed":
         logger.warning("full_scraper[{}]: last-ditch DOM grab for {}", profile, url)
-        results = await _attempt(15_000, last_ditch=True)
-        if results:
-            result = results[0]
+        # Use the configured proxy for the relaxed grab only if direct access already showed an access issue.
+        relaxed_proxy = routed_proxy_url if routed_proxy_url and issue_type in {"geo_restricted", "access_denied", "bot_challenge"} else ""
+        results = await _attempt(15_000, last_ditch=True, proxy_url=relaxed_proxy)
+        relaxed_result = results[0] if results else None
+        _append_attempt("last_ditch", relaxed_result, proxy_url=relaxed_proxy)
+        if relaxed_result is not None:
+            result = relaxed_result
 
-    out = FullPage(url=url, fetch_profile=profile, profiles_merged=[profile])
+    out = FullPage(url=url, fetch_profile=profile, profiles_merged=[profile], access_attempts=access_attempts)
     if result is None:
         out.error = "no crawl result"
+        out.access_status = "fetch_failed"
+        out.access_issue_type = "fetch_error"
+        out.access_issue_reason = "no crawl result"
         return out
 
     out.success = bool(getattr(result, "success", False))
@@ -313,13 +526,25 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> Ful
     out.error = str(getattr(result, "error_message", "") or "")
     out.final_url = getattr(result, "url", "") or getattr(result, "redirected_url", "") or url
 
-    md_obj = getattr(result, "markdown", None)
-    if isinstance(md_obj, str):
-        out.raw_markdown = md_obj
-    elif md_obj is not None:
-        out.raw_markdown = getattr(md_obj, "raw_markdown", "") or getattr(md_obj, "fit_markdown", "") or ""
+    # Classify access status. This prevents geo/access blocks being misread as product absence.
+    _status, _html_preview, _md_preview, _err_preview, _ = _result_texts(result)
+    issue_type, issue_reason, is_geo = _classify_access_issue(_status, _html_preview, _md_preview, _err_preview)
+    out.access_issue_type = issue_type
+    out.access_issue_reason = issue_reason
+    out.geo_restricted = is_geo
+    out.access_status = "accessible" if issue_type == "none" and (out.success or _html_preview or _md_preview) else issue_type
+    chosen_attempt = access_attempts[-1] if access_attempts else {}
+    out.proxy_used = bool(chosen_attempt.get("proxy_used", False))
+    out.proxy_source = str(chosen_attempt.get("proxy_source", "direct"))
 
-    out.raw_html = getattr(result, "cleaned_html", "") or getattr(result, "html", "") or ""
+    md_obj = getattr(result, "markdown", None)
+    out.raw_markdown = (
+        _coerce_text(md_obj)
+        or _coerce_text(getattr(result, "raw_markdown", None))
+        or _coerce_text(getattr(result, "fit_markdown", None))
+    )
+
+    out.raw_html = _coerce_text(getattr(result, "cleaned_html", None)) or _coerce_text(getattr(result, "html", None))
 
     meta = getattr(result, "metadata", None) or {}
     if isinstance(meta, dict):
@@ -358,9 +583,11 @@ async def fetch_full(cfg: Config, url: str, *, profile: str = "standard") -> Ful
         out.tables_html = walker.tables_html
 
     logger.info(
-        "full_scraper[{}]: status={} html={}KB md={}KB images={} tables={} json_ld={}",
+        "full_scraper[{}]: status={} access={} proxy={} html={}KB md={}KB images={} tables={} json_ld={}",
         profile,
         out.status,
+        out.access_status,
+        out.proxy_source or "direct",
         len(out.raw_html) // 1024,
         len(out.raw_markdown) // 1024,
         len(out.images),
@@ -379,6 +606,22 @@ def merge_full_pages(primary: FullPage, extra: FullPage) -> FullPage:
     p.status = p.status or extra.status
     p.error = p.error or extra.error
     p.final_url = p.final_url or extra.final_url
+    # Prefer accessible follow-up status over blocked initial status.
+    if p.access_status != "accessible" and extra.access_status == "accessible":
+        p.access_status = extra.access_status
+        p.access_issue_type = extra.access_issue_type
+        p.access_issue_reason = extra.access_issue_reason
+        p.geo_restricted = extra.geo_restricted
+        p.proxy_used = extra.proxy_used
+        p.proxy_source = extra.proxy_source
+    elif p.access_status == "unknown":
+        p.access_status = extra.access_status
+        p.access_issue_type = extra.access_issue_type
+        p.access_issue_reason = extra.access_issue_reason
+        p.geo_restricted = extra.geo_restricted
+        p.proxy_used = extra.proxy_used
+        p.proxy_source = extra.proxy_source
+    p.access_attempts.extend(extra.access_attempts or [])
     p.title = p.title or extra.title
     p.description = p.description or extra.description
     p.canonical_url = p.canonical_url or extra.canonical_url
@@ -386,10 +629,15 @@ def merge_full_pages(primary: FullPage, extra: FullPage) -> FullPage:
     p.product_meta.update(extra.product_meta)
     p.profiles_merged = list(dict.fromkeys([*p.profiles_merged, *extra.profiles_merged, extra.fetch_profile]))
 
-    if extra.raw_markdown and extra.raw_markdown not in p.raw_markdown:
-        p.raw_markdown = (p.raw_markdown.rstrip() + "\n\n---\n\n" + extra.raw_markdown.strip()).strip()
-    if extra.raw_html and extra.raw_html not in p.raw_html:
-        p.raw_html = (p.raw_html.rstrip() + "\n<!-- PCA_PROFILE_MERGE -->\n" + extra.raw_html.strip()).strip()
+    p.raw_markdown = _coerce_text(p.raw_markdown)
+    extra_md = _coerce_text(extra.raw_markdown)
+    p.raw_html = _coerce_text(p.raw_html)
+    extra_html = _coerce_text(extra.raw_html)
+
+    if extra_md and extra_md not in p.raw_markdown:
+        p.raw_markdown = (p.raw_markdown.rstrip() + "\n\n---\n\n" + extra_md.strip()).strip()
+    if extra_html and extra_html not in p.raw_html:
+        p.raw_html = (p.raw_html.rstrip() + "\n<!-- PCA_PROFILE_MERGE -->\n" + extra_html.strip()).strip()
 
     seen_json = {repr(x) for x in p.json_ld}
     for block in extra.json_ld:
