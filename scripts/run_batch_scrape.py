@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from product_scraping_agent.batch import BatchOptions, run_batch
+from product_scraping_agent.business_validation import enrich_batch_output_csv
 from product_scraping_agent.log import setup_logging
 
 
@@ -60,6 +61,7 @@ async def async_main() -> None:
             domain_profile_learning=not args.disable_domain_profile_learning,
         ),
     )
+    enrich_batch_output_csv(Path(args.output_csv))
     print("\nBATCH SUMMARY")
     print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
 
