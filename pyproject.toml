@@ -1,7 +1,7 @@
 [project]
 name = "product-scraping-agent"
-version = "1.2.9"
-description = "Agentic URL-in product evidence artifact scraper with batch CSV support, source alignment, quality gates, multi-profile Crawl4AI capture, strict capture decisions, batch domain profile learning, vision, business validation, batch preflight checks, and artifact audits."
+version = "1.3.0"
+description = "Agentic URL-in product evidence artifact scraper with batch CSV support, source alignment, quality gates, multi-profile Crawl4AI capture, strict capture decisions, batch domain profile learning, vision, business validation, batch preflight checks, artifact audits, and runtime diagnostics."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "crawl4ai>=0.8",
@@ -38,6 +38,7 @@ includes = ["src/product_scraping_agent"]
 scrape-url = "python scripts/run_scrape.py"
 scrape-batch = "python scripts/run_batch_scrape.py"
 audit-artifacts = "python scripts/run_artifact_audit.py"
+runtime-preflight = "python scripts/run_runtime_preflight.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
