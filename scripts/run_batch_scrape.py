@@ -20,6 +20,7 @@ from product_scraping_agent.batch_preflight import prepare_unique_batch_input_cs
 from product_scraping_agent.business_validation import enrich_batch_output_csv
 from product_scraping_agent.log import setup_logging
 from product_scraping_agent.runtime_preflight import run_runtime_preflight, write_preflight_report
+from product_scraping_agent.semantic_enrichment import enrich_artifact_root
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fail-on-duplicate-input-id", action="store_true", help="Fail before scraping if duplicate explicit input_id values are present")
     parser.add_argument("--skip-runtime-preflight", action="store_true", help="Skip import/config/output-root runtime preflight checks")
     parser.add_argument("--check-browser-launch", action="store_true", help="Launch Chromium during runtime preflight to verify browser installation")
+    parser.add_argument("--skip-semantic-enrichment", action="store_true", help="Skip contract-safe artifact semantic enrichment after scraping")
     parser.add_argument("--write-raw-debug", action="store_true", help="Persist raw observed page markdown/html under debug_raw/")
     parser.add_argument("--disable-domain-profile-learning", action="store_true", help="Do not reorder Crawl4AI profiles based on earlier successful domains in this batch")
     parser.add_argument("--log-level", default="INFO")
@@ -87,6 +89,13 @@ async def async_main() -> None:
             domain_profile_learning=not args.disable_domain_profile_learning,
         ),
     )
+    if not args.skip_semantic_enrichment:
+        enrichment_results = enrich_artifact_root(Path(args.output_root), retailer_label=args.retailer_label)
+        summary.extra["semantic_enrichment"] = {
+            "artifact_count": len(enrichment_results),
+            "changed_artifacts": sum(1 for r in enrichment_results if r.changed_files),
+            "warning_count": sum(len(r.warnings) for r in enrichment_results),
+        }
     enrich_batch_output_csv(Path(args.output_csv))
     print("\nBATCH SUMMARY")
     print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
