@@ -91,11 +91,12 @@ async def async_main() -> None:
     )
     if not args.skip_semantic_enrichment:
         enrichment_results = enrich_artifact_root(Path(args.output_root), retailer_label=args.retailer_label)
-        summary.extra["semantic_enrichment"] = {
+        print("\nSEMANTIC ENRICHMENT")
+        print(json.dumps({
             "artifact_count": len(enrichment_results),
             "changed_artifacts": sum(1 for r in enrichment_results if r.changed_files),
             "warning_count": sum(len(r.warnings) for r in enrichment_results),
-        }
+        }, ensure_ascii=False, indent=2))
     enrich_batch_output_csv(Path(args.output_csv))
     print("\nBATCH SUMMARY")
     print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
