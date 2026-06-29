@@ -1,13 +1,11 @@
+import asyncio
 from pathlib import Path
-
-import pytest
 
 from product_scraping_agent.runtime_preflight import run_runtime_preflight, write_preflight_report
 
 
-@pytest.mark.asyncio
-async def test_runtime_preflight_reports_output_root(tmp_path: Path):
-    report = await run_runtime_preflight(output_root=tmp_path, check_browser_launch=False)
+def test_runtime_preflight_reports_output_root(tmp_path: Path):
+    report = asyncio.run(run_runtime_preflight(output_root=tmp_path, check_browser_launch=False))
     data = report.as_dict()
     assert "checks" in data
     assert any(c["name"] == "output_root:writable" for c in data["checks"])
