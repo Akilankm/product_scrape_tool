@@ -30,7 +30,7 @@ P001,https://fallback.example/product/123,Product title,1234567890123,Requested 
 | `requested_country_code` | No | Original target country code. |
 | `source_retailer_name` | No | Actual retailer/source represented by `product_url`. |
 | `source_country_code` | No | Country/market of `product_url`. |
-| `source_url_role` | No | Role of the URL: `primary_requested_retailer`, `global_fallback`, etc. |
+| `source_url_role` | No | Role of the URL: `primary_requested_retailer`, `alternate_retailer_same_country`, `alternate_retailer_different_country`, `global_fallback`, etc. |
 
 Backward-compatible aliases are also accepted: `url`, `retailer_name`, `country_code`, `EAN`, `MAIN_TEXT`, `RETAILER`, `COUNTRY`.
 
@@ -55,25 +55,52 @@ pdm run scrape-batch \
   --output-root data/scraped
 ```
 
+## Worker-based output behavior
+
+Batch mode is worker-based. Rows are processed in parallel up to `--max-concurrency`, and each worker finalizes its own row artifact independently.
+
+A valid final row should have either:
+
+```text
+_COMPLETE.json
+```
+
+or:
+
+```text
+_FAILED.json
+```
+
+Even when a row fails, the runner should still write a minimal failure artifact so the downstream audit trail is complete.
+
+A row folder that only contains this is not a valid final state:
+
+```text
+request.json
+retailer/manifests/
+```
+
+That means the process was interrupted or an unexpected failure occurred before finalization.
+
 ## Output CSV
 
-The batch output CSV maps each input row to its artifact folder and key evidence files:
-
-```csv
-input_id,product_url,success,artifact_quality,requires_manual_review,artifact_dir,product_evidence_json_path,claims_md_path,quality_report_path,source_alignment_report_path,error
-```
+The batch output CSV maps each input row to its artifact folder and key evidence files.
 
 Important fields:
 
 | Field | Meaning |
 |---|---|
 | `artifact_dir` | Folder containing the clean product evidence artifact. |
+| `success` | Artifact was created. This does not automatically mean the URL yielded rich product evidence. |
 | `artifact_quality` | Deterministic quality gate: `strong`, `usable`, `partial`, `insufficient`, etc. |
 | `requires_manual_review` | Whether the artifact should be reviewed before downstream coding. |
 | `product_evidence_json_path` | Main machine-readable product evidence artifact. |
 | `claims_md_path` | Business-readable claim summary. |
+| `vision_md_path` | Visual evidence summary; should never be empty. |
+| `quality_report_path` | Deterministic quality gate details. |
 | `source_alignment_report_path` | Requested context vs actual scraped source alignment. |
 | `evidence_recovery_report_path` | Whether browser capture, URL/input evidence, or upstream evidence was used. |
+| `error` | Technical exception if the row failed unexpectedly. |
 
 ## Artifact folder per row
 
@@ -83,6 +110,7 @@ For `input_id=P001`, the artifact is written under:
 data/scraped/P001/
 ├── request.json
 ├── scrape_result.json
+├── _COMPLETE.json or _FAILED.json
 └── retailer/
     ├── source.md
     ├── product_evidence.json
@@ -96,6 +124,10 @@ data/scraped/P001/
     ├── images/
     ├── tables/
     └── manifests/
+        ├── agent_trace.json
+        ├── artifact_manifest.json
+        ├── image_manifest.json
+        └── table_manifest.json
 ```
 
 ## Resume behavior
@@ -113,6 +145,12 @@ Use conservative concurrency for retailers and LLM gateways:
 ```
 
 Increase only after confirming the target runtime, LLM gateway, and retailer access are stable.
+
+For debugging row-level behavior, run:
+
+```bash
+--max-concurrency 1
+```
 
 ## Crawl4AI multi-profile capture fields
 
@@ -152,7 +190,6 @@ PCA_SCRAPE_PROFILE_MAX_PROFILES=7
 PCA_SCRAPE_ENABLE_STEALTH=true
 ```
 
-
 ## Domain profile learning
 
 Batch mode can learn the best Crawl4AI profile per domain during the current run.
@@ -168,19 +205,37 @@ pdm run scrape-batch \
   --disable-domain-profile-learning
 ```
 
-## v1.2.5 batch image columns
+## Mandatory image evidence columns
 
 The batch output CSV includes visual evidence columns:
 
 ```text
 image_required
+image_candidate_count
+image_downloaded_count
+final_image_count
+vision_described_count
 screenshot_fallback_used
 visual_evidence_status
 image_failure_reason
 ```
 
+Visual evidence statuses:
+
+| Status | Meaning | Downstream action |
+|---|---|---|
+| `final_product_images_available` | Clean product image was downloaded and retained. | Suitable for automated coding if other gates pass. |
+| `unverified_images_retained` | Image file exists, but not fully vision-confirmed as product image. | Review recommended. |
+| `screenshot_fallback_only` | Direct image recovery failed; page screenshot retained as rescue evidence. | Manual review required. |
+| `image_recovery_failed` | Image candidates existed, but no usable image file was retained. | Not suitable for automated coding. |
+| `no_image_candidates` | No image candidates were discovered. | Not suitable for automated coding. |
+
 Filter `visual_evidence_status != final_product_images_available` to find products that are not ready for downstream automated coding.
 
 ## v1.2.6 Crawl4AI markdown object compatibility
 
-Some Crawl4AI versions return markdown as a `MarkdownGenerationResult` object instead of a plain string. The batch runner now coerces these payloads before logging, scoring, metadata writing, and fail-safe finalization so workers do not fail with `object of type MarkdownGenerationResult has no len()`.
+Some Crawl4AI versions return markdown as a `MarkdownGenerationResult` object instead of a plain string. The batch runner now coerces these payloads before logging, scoring, metadata writing, artifact writing, and fail-safe finalization so workers do not fail with:
+
+```text
+object of type 'MarkdownGenerationResult' has no len()
+```
