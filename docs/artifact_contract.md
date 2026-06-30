@@ -1,6 +1,21 @@
 # Artifact Contract
 
-## Input
+The artifact contract is designed for downstream product coding. It separates operational status, product evidence, visual evidence, source alignment, and quality/readiness decisions.
+
+## Contract summary
+
+```text
+Batch output CSV
+  -> points to one artifact folder per input row
+Artifact folder
+  -> contains machine-readable JSON, markdown dossiers, images, tables, and manifests
+Product evidence
+  -> product-only, provenance-tagged evidence for downstream feature coding
+Quality report
+  -> readiness gate and review/rescrape guidance
+```
+
+## Input contract
 
 Required:
 
@@ -10,18 +25,16 @@ Required:
 }
 ```
 
-Optional:
+Recommended optional context:
 
 ```json
 {
   "main_text": "source product text",
   "ean": "5702017153647",
-  "retailer_name": "Requested retailer name — backward-compatible alias",
-  "country_code": "Requested country code — backward-compatible alias",
-  "requested_retailer_name": "Original target retailer name",
-  "requested_country_code": "Original target country code",
-  "source_retailer_name": "Actual retailer/source represented by product_url, if known",
-  "source_country_code": "Actual country/market represented by product_url, if known",
+  "requested_retailer_name": "Original target retailer",
+  "requested_country_code": "Original target country",
+  "source_retailer_name": "Actual retailer/source represented by product_url",
+  "source_country_code": "Actual country/market represented by product_url",
   "source_url_role": "primary_requested_retailer | alternate_retailer_same_country | alternate_retailer_different_country | same_retailer_different_country | marketplace_fallback | global_fallback | unknown",
   "product_hint": "override context shown to image/planner/evidence LLM",
   "upstream_ai_evidence": "optional AI/search evidence already produced upstream",
@@ -30,189 +43,152 @@ Optional:
 }
 ```
 
-Optional context is not search input. It is used for provenance, image relevance, same-page evidence planning, and product-only normalization. Optional upstream evidence is also not searched by this agent; it is only consumed when already produced by the discovery layer and is tagged as `A` evidence.
+Optional context is not search input. It is provenance and recovery context. The scraper never searches.
 
-## Output folder
+## Batch CSV schema
+
+### Input and source context
+
+| Column | Meaning |
+|---|---|
+| `row_number` | Batch row number |
+| `input_id` | Stable row/artifact identifier |
+| `product_url` | Supplied URL to scrape |
+| `main_text` | Optional product identity text |
+| `ean` | Optional EAN/GTIN identity hint |
+| `requested_retailer_name` | Business target retailer |
+| `requested_country_code` | Business target country |
+| `source_retailer_name` | Retailer represented by supplied URL |
+| `source_country_code` | Country represented by supplied URL |
+| `source_url_role` | Primary/fallback/source role |
+
+### Quality and capture status
+
+| Column | Meaning |
+|---|---|
+| `success` | Artifact was created |
+| `artifact_quality` | Strong/usable/partial/insufficient style quality gate |
+| `quality_score` | Deterministic quality score |
+| `requires_manual_review` | Whether the row should be reviewed before coding |
+| `missing_critical_fields` | Critical missing evidence fields |
+| `quality_warnings` | Quality warnings |
+| `access_status` | Accessible/access_denied/bot_challenge/geo_restricted/rate_limited/fetch_error |
+| `browser_visible` | Browser capture saw product-visible signals |
+| `product_details_recovered` | Product details were recovered from at least one evidence axis |
+| `recovery_status` | Recovery status summary |
+| `evidence_axes_used` | Provenance axes used in final evidence |
+| `capture_profile_used` | Selected Crawl4AI profile |
+| `capture_profiles_attempted` | Profiles attempted against same URL |
+| `capture_score` | Numeric capture quality score |
+| `capture_grade` | Rich/usable/weak/mixed/blocked style grade |
+| `capture_decision` | Final capture decision |
+| `real_scrape_evidence` | True when actual page evidence was captured |
+| `weak_capture_reasons` | Reasons capture was weak |
+| `visual_evidence_status` | Final visual evidence status |
+| `image_failure_reason` | Why image recovery failed or degraded |
+
+### Artifact paths
+
+| Column | Meaning |
+|---|---|
+| `artifact_dir` | Root artifact folder for the row |
+| `request_json_path` | Request metadata path |
+| `scrape_result_json_path` | Public scrape result path |
+| `product_evidence_json_path` | Main structured evidence path |
+| `product_evidence_md_path` | Markdown evidence dossier path |
+| `claims_md_path` | Compact evidence-backed claim summary path |
+| `source_md_path` | Clean product-only source text path |
+| `vision_md_path` | Visual observations path |
+| `quality_report_path` | Quality/readiness gate path |
+| `source_alignment_report_path` | Requested/source alignment report path |
+| `image_manifest_path` | Image manifest path |
+| `table_manifest_path` | Table manifest path |
+| `artifact_manifest_path` | Artifact manifest path |
+| `agent_trace_path` | Agentic loop trace path |
+
+## Artifact folder
 
 ```text
-<output_root>/<scrape_id>/<retailer_label>/
+data/scraped/<input_id>/
+├── request.json
+├── scrape_result.json
+├── _COMPLETE.json or _FAILED.json
+└── retailer/
+    ├── source.md
+    ├── product_evidence.json
+    ├── product_evidence.md
+    ├── claims.md
+    ├── vision.md
+    ├── metadata.json
+    ├── quality_report.json
+    ├── source_alignment_report.json
+    ├── evidence_recovery_report.json
+    ├── noise_report.json
+    ├── images/
+    ├── tables/
+    └── manifests/
+        ├── agent_trace.json
+        ├── artifact_manifest.json
+        ├── image_manifest.json
+        └── table_manifest.json
 ```
 
-Default `retailer_label` is `retailer`.
+## `product_evidence.json`
 
-## Product-only artifact files
+Top-level shape:
 
 ```text
-source.md
+product_focus_summary
+source_alignment
+product_identity
+retailer_claims
+source_specific_claims
+product_only_text_blocks
+structured_claims
+table_claims
+visual_claims
+upstream_indexed_claims
+url_derived_claims
+input_context_claims
+discrepancies
+gaps
+noise_exclusion_summary
+quality
+```
+
+## Semantic enrichment location
+
+Contract-safe enrichment is nested under existing flexible quality objects.
+
+```text
 product_evidence.json
-product_evidence.md
-claims.md
-vision.md
-metadata.json
-noise_report.json
-evidence_recovery_report.json
-source_alignment_report.json
+  quality
+    semantic_enrichment
+      identity_verification
+      feature_evidence_readiness
+      coding_readiness
+      claim_row_enrichment_count
+
 quality_report.json
-tables/
-images/
-manifests/agent_trace.json
-manifests/image_manifest.json
-manifests/table_manifest.json
-manifests/artifact_manifest.json
+  semantic_enrichment
+    identity_verification
+    feature_evidence_readiness
+    coding_readiness
 ```
 
-## Artifact semantics
+## Evidence axes
 
-- `product_evidence.json` is the primary downstream file.
-- `product_evidence.md` is the human-readable version of the same normalized evidence.
-- `claims.md` is generated only from `product_evidence.json` and should not reintroduce page noise.
-- `source.md` contains product-only text blocks, not full raw page markdown.
-- `noise_report.json` records the exclusion policy without storing raw noisy text.
-- `evidence_recovery_report.json` explains whether browser access was visible, whether product details were recovered, and which evidence axes were used.
-- `source_alignment_report.json` separates requested retailer/country from the actual scraped source and scopes fallback-source commercial claims safely.
-- `quality_report.json` is a deterministic acceptance gate for downstream product coding. It reports `strong`, `usable`, `partial`, or `insufficient`, plus missing critical fields and warnings.
-- `debug_raw/` is disabled by default and only exists if explicitly enabled.
+| Axis | Meaning | Typical source |
+|---|---|---|
+| `T` | Rendered product text | Product title, description, bullets |
+| `V` | Visual evidence | Retained image, package observation, visible labels |
+| `S` | Structured metadata | JSON-LD, Open Graph, product meta tags |
+| `D` | HTML tables | Product specification tables |
+| `I` | Input context | Main text, EAN, requested context |
+| `U` | URL-derived evidence | URL slug or canonical URL hints |
+| `A` | Upstream caller-supplied evidence | Search/AI/indexed snippets passed by caller |
 
-## Agentic same-page loop
-
-The LLM planner may request only these same-product-URL actions:
-
-```text
-full_page_scroll
-expand_common_sections
-extract_gallery_sources
-retry_relaxed
-stop
-```
-
-The planner cannot request web search or a different URL. If supplied, upstream AI/search evidence is used only by the evidence normalizer/recovery layer, not by the scraper planner as a search instruction.
-
-## Downstream handoff
-
-For a product coding agent, hand off the full artifact folder. The most important files are:
-
-```text
-product_evidence.json
-product_evidence.md
-claims.md
-source.md
-metadata.json
-source_alignment_report.json
-vision.md
-images/
-tables/
-manifests/artifact_manifest.json
-```
-
-## Source alignment contract
-
-The input URL may be an alternate or fallback source. Therefore the agent separates:
-
-```text
-requested target context  = original retailer/country from the business/search row
-actual scraped source     = product_url and optional source retailer/country
-```
-
-`source_alignment_report.json` records:
-
-```json
-{
-  "requested_context": {"retailer_name": "Requested Retailer", "country_code": "CO"},
-  "scraped_source": {
-    "product_url": "https://fallback.example/product/123",
-    "retailer_name": "Fallback Retailer",
-    "country_code": "US",
-    "source_url_role": "global_fallback"
-  },
-  "alignment_status": "fallback_source_used",
-  "retailer_match": false,
-  "country_match": false,
-  "product_facts_transfer_allowed": true,
-  "requested_retailer_claims_allowed": false,
-  "source_specific_claim_scope": "scraped_source_only"
-}
-```
-
-Claim scoping rule:
-
-| Claim type | Fallback source allowed? | Scope |
-|---|---:|---|
-| Product identity/facts: brand, product name, EAN/GTIN, manufacturer, features, contents, age range, images | Yes, if evidence-grounded | Product-level |
-| Commercial/source-specific: price, availability, delivery, seller, marketplace terms, shipping, ratings | Only for scraped source unless alignment is primary | Source-specific only |
-
-No retailer or country is hardcoded. The model is generic and data-driven from the provided request fields.
-
-
-## Access / geo restriction contract
-
-The artifact distinguishes product evidence from access failure. If the retailer page is blocked from the runtime geography, the scraper records the condition instead of treating the URL as invalid or the product as absent.
-
-Fields written to `metadata.json`, `scrape_result.json`, `artifact_manifest.json`, and the quality block of `product_evidence.json`:
-
-```json
-{
-  "access_status": "accessible | geo_restricted | access_denied | bot_challenge | rate_limited | server_error | fetch_error | unknown",
-  "access_issue_type": "geo_restricted",
-  "access_issue_reason": "HTTP 451 legal/geographic restriction",
-  "geo_restricted": true,
-  "proxy_used": false,
-  "proxy_source": "direct",
-  "access_attempts": []
-}
-```
-
-When `PCA_GEO_PROXY_ENABLED=true` and a proxy is configured through `PCA_PROXY_URL_<COUNTRY>` or `PCA_PROXY_URL`, the same URL is retried through that authorised egress path. Search/discovery is still not performed by this agent.
-
-## Evidence recovery contract
-
-Browser visibility is not the same as product evidence availability. If the browser cannot render the product page but the caller supplies upstream indexed/AI evidence, the agent can still produce a product artifact. The artifact records:
-
-```json
-{
-  "browser_visible": false,
-  "product_details_recovered": true,
-  "recovery_status": "upstream_recovery",
-  "evidence_axes_used": ["A", "I"],
-  "upstream_evidence_present": true
-}
-```
-
-Allowed axes:
-
-```text
-B = direct browser-rendered page
-P = proxy/target-country rendered page
-T = rendered product text
-S = structured metadata/meta tags
-J = JSON-LD
-D = HTML tables
-V = vision/image
-A = caller-supplied upstream indexed/search/AI evidence
-I = user input context
-```
-
-If no browser, metadata, image, table, or upstream evidence is available, the agent must report insufficient evidence and must not invent product facts.
-
-
-## Quality gate contract
-
-`quality_report.json` is written for every run. It does not add facts; it audits whether the artifact is safe to hand to downstream product coding.
-
-Example:
-
-```json
-{
-  "artifact_quality": "usable",
-  "quality_score": 78,
-  "requires_manual_review": false,
-  "missing_critical_fields": [],
-  "warnings": ["3 image candidate(s) failed with HTTP 403; CDN recovery may be partial"],
-  "evidence_axes_used": ["T", "D", "V", "S"],
-  "recommended_followups": []
-}
-```
-
-Quality labels:
+## Quality labels
 
 ```text
 strong       = rich multi-axis evidence; safe for downstream coding
@@ -221,8 +197,23 @@ partial      = usable only with review or supplemental evidence
 insufficient = do not code automatically; evidence is too weak
 ```
 
-## v1.2.5 mandatory visual evidence
+## Downstream read order
 
-For product identification, `retailer/images/` must contain at least one retained image file for the artifact to be considered usable. If clean gallery image recovery fails, the scraper may write `images/screenshot_fallback.png`, but this is marked as `screenshot_fallback_only` and requires manual review.
+1. `retailer/quality_report.json`
+2. `retailer/product_evidence.json`
+3. `retailer/claims.md`
+4. `retailer/vision.md`
+5. `retailer/source.md`
+6. `retailer/manifests/image_manifest.json`
+7. `retailer/manifests/table_manifest.json`
 
-`vision.md` must always contain a visual evidence decision table, even when no image could be recovered.
+## Stability rules
+
+| Rule | Status |
+|---|---|
+| Existing artifact file names are stable | Required |
+| Existing folder layout is stable | Required |
+| JSON files must be valid UTF-8 JSON | Required |
+| Terminal marker must be `_COMPLETE.json` or `_FAILED.json` | Required |
+| Search evidence must be caller-supplied, not discovered by scraper | Required |
+| Source-specific commercial claims stay scoped to scraped source | Required |
