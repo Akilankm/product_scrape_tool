@@ -1,88 +1,56 @@
 # Product Scraping Agent
 
-A clean, isolated **product URL → product-only retailer evidence artifact** agent.
+A clean, isolated **product URL → product-only retailer evidence artifact** runtime.
 
 This repository intentionally contains only product scraping runtime code. It does **not** contain URL search/discovery, product coding, reporting spreadsheets, Streamlit UI, Docker search infrastructure, or rulebook logic.
 
 ## Current release
 
 ```text
-Version: 1.2.6
+Version: 1.3.5
 Backend: Crawl4AI only
 Scope  : supplied product URL only; no search and no alternate URL discovery
+Output : high-grade product evidence artifact for downstream product coding
 ```
 
-### What is covered through v1.2.6
+## Documentation map
 
-```text
-v1.2.3  Crawl4AI multi-profile same-URL capture
-v1.2.4  strict capture decisions and batch domain-profile learning
-v1.2.5  worker-safe row finalization and mandatory image evidence
-v1.2.6  Crawl4AI MarkdownGenerationResult compatibility fix
+| Document | Purpose |
+|---|---|
+| [Documentation index](docs/index.md) | Main navigation |
+| [Architecture](docs/architecture.md) | Mermaid component flow, sequence diagram, access-attempt flow, lifecycle state diagram |
+| [Usage guide](docs/usage.md) | Install, preflight, single URL, batch, audit, triage, quality checks |
+| [Artifact contract](docs/artifact_contract.md) | Batch CSV schema, artifact folder schema, evidence axes, semantic enrichment |
+| [Runbook](docs/runbook.md) | Review/retry/rescrape operations guide |
+| [ADRs](docs/adr/README.md) | Architecture decision records |
+
+## What this tool does
+
+```mermaid
+flowchart LR
+    A[Supplied product URL] --> B[Crawl4AI same-URL capture]
+    B --> C[Product-only evidence normalization]
+    C --> D[Images, tables, metadata, claims]
+    D --> E[Quality gate]
+    E --> F[Contract-safe semantic enrichment]
+    F --> G[Evidence artifact for product coding]
 ```
-
-The scraper is **Crawl4AI-only**. It does not use Firecrawl or any paid scraping backend.
-
-## Install modes
-
-### Core scraper install — recommended first
-
-Use this when you only want the product scraping agent runtime. This does **not** install notebook dependencies, so it avoids the `ipykernel -> IPython -> jedi` chain.
-
-```bash
-pdm install --prod
-pdm run playwright install chromium
-```
-
-### Notebook install — optional
-
-Install this only when you want to run notebooks.
-
-```bash
-pdm install -G notebook
-```
-
-### Test install — optional
-
-```bash
-pdm install -G test
-pdm run pytest
-```
-
-If install hangs at `jedi`, it is almost always from the notebook dependency chain, not the core scraper. Use `pdm install --prod` for the scraper-only runtime.
 
 ## Runtime contract
 
-```text
-INPUT   : product_url
-OPTIONAL: main_text, ean, requested retailer/country, actual source retailer/country, source_url_role, product_hint
-OPTIONAL RECOVERY EVIDENCE: upstream_ai_evidence, candidate_snippets, search_evidence
-OUTPUT  : product-only evidence artifact folder
-```
+| Layer | Contract |
+|---|---|
+| Input | `product_url` plus optional identity/source hints |
+| Runtime | Crawl4AI-only, same supplied URL, no search |
+| Output | One artifact folder per input row |
+| Quality | Deterministic readiness gate and business validation |
+| Downstream | Product-coding engine consumes artifact as evidence |
 
-The optional fields are provenance and identity hints. They help image relevance filtering, same-page evidence planning, and product-only evidence normalization. They never trigger search.
+Optional identity/source hints help provenance, image relevance, and wrong-product detection. They never trigger search.
 
-## Source alignment contract
+## Same-URL capture profiles
 
-The provided `product_url` is always treated as the **actual evidence source**.
-
-The requested retailer/country and the actual scraped source may differ:
-
-```text
-requested_retailer_name = original target retailer
-requested_country_code  = original target country
-source_retailer_name    = retailer/domain represented by product_url
-source_country_code     = country/market represented by product_url
-source_url_role         = primary_requested_retailer / alternate_retailer_same_country / global_fallback / etc.
-```
-
-This prevents fallback-source evidence from being incorrectly treated as requested-retailer evidence.
-
-## Same-URL Crawl4AI capture
-
-The agent is an **agentic evidence builder**, not a one-pass page dump.
-
-For each supplied URL, it can try multiple same-URL Crawl4AI profiles:
+The scraper can try these profiles against the same supplied URL:
 
 ```text
 standard
@@ -94,162 +62,82 @@ shadow_iframe
 retry_relaxed
 ```
 
-Each profile is scored for real product evidence. The selected profile is written to artifacts and batch output using:
+Each profile is scored for real product evidence. A thin HTTP-200 shell is not treated as a high-grade scrape.
 
-```text
-capture_profile_used
-capture_profiles_attempted
-capture_score
-capture_grade
-capture_decision
-real_scrape_evidence
-weak_capture_reasons
-```
+## Evidence axes
 
-This prevents a thin HTTP-200 shell page from being treated as a successful product scrape.
-
-Configure the profile sequence in `.env`:
-
-```env
-PCA_SCRAPE_MULTI_PROFILE_ENABLED=true
-PCA_SCRAPE_PROFILE_SEQUENCE=standard,load_wait,full_page_scroll,expand_common_sections,extract_gallery_sources,shadow_iframe,retry_relaxed
-PCA_SCRAPE_PROFILE_EARLY_STOP_SCORE=82
-PCA_SCRAPE_PROFILE_MAX_PROFILES=7
-PCA_SCRAPE_ENABLE_STEALTH=true
-```
-
-## Visual evidence contract
-
-For this project, product images are mandatory for automated product identification.
-
-A clean product image is required for an artifact to be considered directly usable. If clean image recovery fails, the agent may keep lower-confidence visual rescue evidence, but the artifact must be marked for review.
-
-Visual statuses:
-
-| Status | Meaning |
+| Axis | Meaning |
 |---|---|
-| `final_product_images_available` | At least one clean product-gallery image was retained. |
-| `unverified_images_retained` | Image files were retained, but not fully vision-confirmed as product images. |
-| `screenshot_fallback_only` | Direct image recovery failed; page screenshot was retained as rescue visual evidence. Manual review required. |
-| `image_recovery_failed` | Image candidates existed but no usable image file was retained. |
-| `no_image_candidates` | No image candidates were discovered in the selected capture. |
+| `T` | Rendered product text |
+| `V` | Visual evidence |
+| `S` | Structured metadata, JSON-LD, meta tags |
+| `D` | HTML tables |
+| `I` | Input context |
+| `U` | URL-derived evidence |
+| `A` | Upstream caller-supplied evidence |
 
-Screenshot fallback is **not** treated as a clean product image. It is a rescue path for visual inspection and is always lower confidence than a retained product-gallery image.
+## Install
 
-Relevant settings:
-
-```env
-PCA_IMAGE_REQUIRED=true
-PCA_IMAGE_KEEP_UNVERIFIED_ON_VISION_FAILURE=true
-PCA_SCREENSHOT_FALLBACK_ENABLED=true
-PCA_SCREENSHOT_TIMEOUT=25
-PCA_SCREENSHOT_FULL_PAGE=false
-```
-
-## Worker-safe batch finalization
-
-Batch mode is worker-based. Each input row is processed independently and should produce a finalized row artifact even if scraping, image recovery, or LLM normalization fails.
-
-Every row should end with either:
-
-```text
-_COMPLETE.json
-```
-
-or:
-
-```text
-_FAILED.json
-```
-
-Even failed rows should write a minimal artifact containing:
-
-```text
-request.json
-scrape_result.json
-retailer/source.md
-retailer/product_evidence.json
-retailer/quality_report.json
-retailer/source_alignment_report.json
-retailer/vision.md
-retailer/manifests/artifact_manifest.json
-```
-
-A row left with only `request.json` and `retailer/manifests/` is not a valid final state.
-
-## Crawl4AI markdown compatibility
-
-Crawl4AI may return markdown as a plain string in some versions and as a `MarkdownGenerationResult` object in others. v1.2.6 normalizes those payloads before logging, scoring, metadata writing, artifact writing, and failure finalization.
-
-This prevents failures like:
-
-```text
-TypeError: object of type 'MarkdownGenerationResult' has no len()
-```
-
-## Run from Python
-
-```python
-from pathlib import Path
-from product_scraping_agent import ProductScrapingAgent, ScrapeRequest
-
-result = await ProductScrapingAgent().scrape(
-    ScrapeRequest(
-        product_url="https://retailer.example/product/123",
-        main_text="LEGO DUPLO 10965 Bath Time Fun",
-        ean="5702017153647",
-
-        # Backward-compatible aliases for requested context
-        retailer_name="Requested Retailer",
-        country_code="CO",
-
-        # Optional actual URL/source context when product_url is a fallback source
-        source_retailer_name="Fallback Retailer",
-        source_country_code="US",
-        source_url_role="global_fallback",
-
-        output_root=Path("data/scraped"),
-        max_agent_iterations=2,
-
-        # Optional: pass evidence already produced by search/discovery.
-        # The scraper will not search; it only uses this as A-axis recovery evidence.
-        upstream_ai_evidence="SerpAPI AI Mode / indexed evidence text here",
-        candidate_snippets=["Retailer indexed snippet here"],
-    )
-)
-
-print(result.output_dir)
-print(result.product_evidence_json_path)
-print(result.visual_evidence_status)
-print(result.artifact_quality)
-```
-
-## Run from CLI
+### Core runtime
 
 ```bash
-pdm run python scripts/run_scrape.py \
+pdm install --prod
+pdm run playwright install chromium
+```
+
+### Test tooling
+
+```bash
+pdm install -G test
+pdm run quality-check
+```
+
+### Notebook tooling
+
+```bash
+pdm install -G notebook
+```
+
+## Runtime preflight
+
+```bash
+pdm run runtime-preflight \
+  --output-root data/scraped \
+  --report-json data/runtime_preflight.json
+```
+
+With browser launch check:
+
+```bash
+pdm run runtime-preflight \
+  --output-root data/scraped \
+  --check-browser-launch
+```
+
+## Run single URL
+
+```bash
+pdm run scrape-url \
   --url "https://retailer.example/product/123" \
-  --main-text "LEGO DUPLO 10965 Bath Time Fun" \
-  --ean "5702017153647" \
+  --main-text "Toy product title" \
+  --ean "1234567890123" \
   --requested-retailer-name "Requested Retailer" \
-  --requested-country-code "CO" \
-  --source-retailer-name "Fallback Retailer" \
-  --source-country-code "US" \
-  --source-url-role "global_fallback" \
-  --max-agent-iterations 2 \
-  --upstream-ai-evidence-file evidence/ai_mode.txt \
-  --candidate-snippet "Indexed retailer snippet..." \
-  --search-evidence-json evidence/search_evidence.json \
+  --requested-country-code "CZ" \
+  --source-retailer-name "Actual URL Retailer" \
+  --source-country-code "CZ" \
+  --source-url-role "primary_requested_retailer" \
   --output-root data/scraped
 ```
 
-## Run batch CSV
+## Run batch
 
 ```bash
 pdm run scrape-batch \
-  --input-csv data/samples/batch_input_sample.csv \
+  --input-csv data/batch_input.csv \
   --output-csv data/batch_scrape_output.csv \
   --summary-json data/batch_scrape_summary.json \
+  --preflight-json data/batch_preflight.json \
+  --runtime-preflight-json data/runtime_preflight.json \
   --output-root data/scraped \
   --max-concurrency 2 \
   --resume
@@ -259,35 +147,19 @@ Recommended input CSV:
 
 ```csv
 input_id,product_url,main_text,ean,requested_retailer_name,requested_country_code,source_retailer_name,source_country_code,source_url_role
-P001,https://fallback.example/product/123,Product title,1234567890123,Requested Retailer,CO,Fallback Retailer,US,global_fallback
+P001,https://retailer.example/product/123,Toy product title,1234567890123,Requested Retailer,CZ,Actual URL Retailer,CZ,primary_requested_retailer
 ```
 
-Batch output maps each input row to its artifact directory and diagnostics:
+Semantic enrichment runs after batch artifact creation by default. To skip it:
 
-```text
-input_id
-product_url
-success
-artifact_quality
-requires_manual_review
-capture_decision
-real_scrape_evidence
-visual_evidence_status
-image_failure_reason
-artifact_dir
-product_evidence_json_path
-vision_md_path
-quality_report_path
-source_alignment_report_path
-error
+```bash
+--skip-semantic-enrichment
 ```
-
-See `docs/batch_scraping.md` for the complete batch contract.
 
 ## Expected artifact structure
 
 ```text
-data/scraped/<scrape_id>/
+data/scraped/<input_id>/
 ├── request.json
 ├── scrape_result.json
 ├── _COMPLETE.json or _FAILED.json
@@ -315,14 +187,32 @@ data/scraped/<scrape_id>/
 
 | Signal | Meaning |
 |---|---|
-| `success=true` | The artifact was created, not necessarily that the page was fully scraped. |
-| `real_scrape_evidence=true` | Crawl4AI captured meaningful product-page evidence beyond input/URL hints. |
-| `visual_evidence_status=final_product_images_available` | Clean product visual evidence is present. |
-| `requires_manual_review=true` | Do not send directly to automated product coding without inspection. |
-| `artifact_quality=insufficient` | Artifact exists but is not reliable enough for downstream automated coding. |
+| `success=true` | Artifact was created, not necessarily coding-ready |
+| `real_scrape_evidence=true` | Crawl4AI captured meaningful product-page evidence |
+| `visual_evidence_status=final_product_images_available` | Clean product visual evidence is present |
+| `requires_manual_review=true` | Do not send directly to automated product coding without inspection |
+| `semantic_enrichment.coding_readiness.ready_for_coding=true` | Artifact passed identity, quality, visual, and review gates |
+
+## Post-run commands
+
+Artifact audit:
+
+```bash
+pdm run audit-artifacts \
+  --output-root data/scraped \
+  --output-csv data/artifact_audit.csv \
+  --summary-json data/artifact_audit_summary.json
+```
+
+Batch triage:
+
+```bash
+pdm run triage-batch \
+  --input-csv data/batch_scrape_output.csv \
+  --output-csv data/batch_triage.csv \
+  --summary-json data/batch_triage_summary.json
+```
 
 ## No-search boundary
 
-The scraper never performs web search or URL discovery.
-
-If upstream systems already produced indexed snippets or AI Mode evidence, they can be passed explicitly as recovery evidence. Those claims are tagged as `A` evidence axis and remain distinguishable from browser-rendered page evidence.
+The scraper never performs web search or URL discovery. If upstream systems already produced indexed snippets or AI Mode evidence, they can be passed explicitly as recovery evidence. Those claims are tagged as `A` evidence axis and remain distinguishable from browser-rendered page evidence.
